@@ -17,16 +17,22 @@ pub use exclude::{COMMON_JUNK, ExcludeRules};
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::time::{Instant, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use k92_core::dto::{BackupReport, EntryKind, JobPhase, ProgressEvent, SkipReason, SkippedItemDto};
 use k92_core::{CancelToken, Error, IoContext, ObjectHash, ProgressFn, RelPath, Result};
 use k92_repository::manifest::{
     SNAPSHOT_FORMAT, SNAPSHOT_FORMAT_VERSION, SkippedItem, SnapshotStats,
 };
-use k92_repository::{Entry, HostInfo, RepoWriter, Repository, Snapshot, SourceRoot, StoreError};
+use k92_repository::{
+    Entry, HostInfo, RepoWriter, Repository, SMALL_OBJECT, Snapshot, SourceRoot, StoreError,
+    StoredObject,
+};
 use k92_windows::FileClass;
 
 #[derive(Debug, Clone)]
@@ -44,15 +50,54 @@ impl SourceSpec {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct BackupOptions {
     pub sources: Vec<SourceSpec>,
+    /// Store compressible files zstd-compressed (on format v2 repositories). Default on.
+    pub compress: bool,
+    /// Files copied at the same time. `None` picks a value from the CPU count.
+    pub threads: Option<usize>,
     /// Ignore size+mtime shortcuts and re-read every file ("deep backup").
     pub rehash_all: bool,
     /// Folders, name patterns and size limits to leave out.
     pub exclude: ExcludeRules,
     /// Free-space query for the destination. `None` asks the OS; tests substitute their own.
     pub available_space: Option<fn(&Path) -> io::Result<u64>>,
+}
+
+impl Default for BackupOptions {
+    fn default() -> Self {
+        BackupOptions {
+            sources: Vec::new(),
+            compress: true,
+            threads: None,
+            rehash_all: false,
+            exclude: ExcludeRules::default(),
+            available_space: None,
+        }
+    }
+}
+
+/// Files at least this large go through a single "big file" lane, so a spinning backup drive
+/// writes at most one large stream at a time while small files are copied in parallel.
+const BIG_FILE: u64 = 8 * 1024 * 1024;
+const PROGRESS_TICK: Duration = Duration::from_millis(250);
+/// Small files sit in an open pack until it is committed; commit at least this often so the
+/// resume journal keeps up during long backups.
+const PACK_FLUSH_EVERY: Duration = Duration::from_secs(15);
+const PACK_FLUSH_FILES: usize = 5000;
+
+/// File types that are already compressed; trying again only costs CPU time.
+const COMPRESSED_EXTENSIONS: &[&str] = &[
+    "7z", "aac", "apk", "avi", "avif", "bz2", "cab", "docx", "dmg", "epub", "flac", "gif", "gz",
+    "heic", "heif", "jar", "jpeg", "jpg", "lz4", "m4a", "m4v", "mkv", "mov", "mp3", "mp4", "msi",
+    "odp", "ods", "odt", "ogg", "opus", "png", "pptx", "rar", "tgz", "webm", "webp", "wma", "wmv",
+    "xlsx", "xz", "zip", "zst",
+];
+
+fn worth_compressing(name: &str) -> bool {
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+    !ext.is_some_and(|e| COMPRESSED_EXTENSIONS.contains(&e.as_str()))
 }
 
 /// Space kept free on the destination beyond the data itself (plus room for the manifest).
@@ -77,6 +122,7 @@ pub fn run_backup(
     let parent = repo.latest_valid_snapshot()?;
     let id = writer.next_snapshot_id()?;
     let checkpoint_path = repo.checkpoint_path();
+    let bytes_read = AtomicU64::new(0);
 
     let mut job = Job {
         writer: &writer,
@@ -101,13 +147,18 @@ pub fn run_backup(
         bytes_total: None,
         bytes_needed: 0,
         rehash_all: opts.rehash_all,
+        compress: opts.compress,
         exclude: &opts.exclude,
         entries: Vec::new(),
         skipped: Vec::new(),
         stats: SnapshotStats::default(),
         files_copied: 0,
         files_unchanged: 0,
-        bytes_done: 0,
+        bytes_read: &bytes_read,
+        dispatched_bytes: 0,
+        pool: None,
+        unflushed: Vec::new(),
+        last_pack_flush: Instant::now(),
     };
     if let Some(p) = &parent {
         for e in p.entries.iter().filter(|e| e.kind == EntryKind::File) {
@@ -142,13 +193,67 @@ pub fn run_backup(
     job.space.check_upfront(totals.bytes_needed)?;
 
     job.journal = Some(checkpoint::Journal::open(&checkpoint_path)?);
-    for root in &roots {
-        job.scan_source(root)?;
-    }
+    let small_workers = opts.threads.unwrap_or_else(default_threads).max(1);
+    let abort = cancel.child();
+    std::thread::scope(|scope| -> Result<()> {
+        let (small_tx, small_rx) = mpsc::sync_channel::<Work>(small_workers * 16);
+        let (big_tx, big_rx) = mpsc::sync_channel::<Work>(1);
+        let (done_tx, done_rx) = mpsc::channel::<Done>();
+        let small_rx = Arc::new(Mutex::new(small_rx));
+        let big_rx = Arc::new(Mutex::new(big_rx));
+        let lanes = (0..small_workers)
+            .map(|_| small_rx.clone())
+            .chain(std::iter::once(big_rx));
+        for rx in lanes {
+            let done = done_tx.clone();
+            let (writer, abort, bytes_read) = (&writer, &abort, &bytes_read);
+            scope.spawn(move || copy_worker(writer, rx, done, abort, bytes_read));
+        }
+        drop(done_tx);
+        job.pool = Some(Pool {
+            small: small_tx,
+            big: big_tx,
+            done: done_rx,
+            in_flight: 0,
+        });
+
+        let result = (|| {
+            for root in &roots {
+                job.scan_source(root)?;
+            }
+            job.drain(true)
+        })();
+        if result.is_err() {
+            abort.cancel();
+        }
+        // Close the queues and collect what the workers finish; completed files are still
+        // journaled so a retry does not read them again.
+        if let Some(pool) = job.pool.take() {
+            let Pool {
+                small, big, done, ..
+            } = pool;
+            drop((small, big));
+            for d in done {
+                if result.is_err() {
+                    job.journal_only(d);
+                }
+            }
+        }
+        if result.is_err() {
+            // Keep the small files stored so far: commit their pack, then journal them.
+            if writer.flush_pack().is_ok() {
+                let _ = job.journal_unflushed();
+            }
+        }
+        result
+    })?;
 
     // Files in the parent (for the same sources) that no longer exist.
-    let now_keys: HashSet<(String, &RelPath)> = job
-        .entries
+    let entries: Vec<Entry> = std::mem::take(&mut job.entries)
+        .into_iter()
+        .flatten()
+        .collect();
+    let now_keys: HashSet<(String, &RelPath)> = entries
         .iter()
         .filter(|e| e.kind == EntryKind::File)
         .map(|e| (source_key(&roots[e.source as usize].path), &e.path))
@@ -161,7 +266,7 @@ pub fn run_backup(
         .count() as u64;
 
     cancel.check()?;
-    progress(job.event(JobPhase::Committing, job.stats.files, None));
+    progress(job.event(JobPhase::Committing, job.files_done(), None));
     job.stats.skipped = job.skipped.len() as u64;
     let snapshot = Snapshot {
         format: SNAPSHOT_FORMAT.into(),
@@ -173,7 +278,7 @@ pub fn run_backup(
         completed_at: now_rfc3339(),
         host: HostInfo::current(),
         sources: roots.iter().map(|r| r.root.clone()).collect(),
-        entries: std::mem::take(&mut job.entries),
+        entries,
         skipped: std::mem::take(&mut job.skipped),
         stats: job.stats.clone(),
     };
@@ -193,6 +298,7 @@ pub fn run_backup(
         excluded: snapshot.stats.excluded,
         new_objects: snapshot.stats.new_objects,
         new_bytes: snapshot.stats.new_bytes,
+        new_stored_bytes: snapshot.stats.new_stored_bytes,
         skipped: snapshot
             .skipped
             .iter()
@@ -350,19 +456,65 @@ struct Job<'a> {
     bytes_total: Option<u64>,
     bytes_needed: u64,
     rehash_all: bool,
+    compress: bool,
     exclude: &'a ExcludeRules,
-    entries: Vec<Entry>,
+    /// In walk order; `None` marks a file still being copied (or skipped in the end).
+    entries: Vec<Option<Entry>>,
     skipped: Vec<SkippedItem>,
     stats: SnapshotStats,
     files_copied: u64,
     files_unchanged: u64,
-    bytes_done: u64,
+    /// Bytes read from source files so far (updated by the copy workers).
+    bytes_read: &'a AtomicU64,
+    /// Bytes handed to the workers, for the space estimate.
+    dispatched_bytes: u64,
+    pool: Option<Pool>,
+    /// Journal records for packed files, written once their pack is committed.
+    unflushed: Vec<checkpoint::Record>,
+    last_pack_flush: Instant,
+}
+
+struct Pool {
+    small: SyncSender<Work>,
+    big: SyncSender<Work>,
+    done: Receiver<Done>,
+    in_flight: usize,
+}
+
+/// One file for a copy worker. `size`/`mtime` come from the scan and are re-checked after reading.
+struct Work {
+    slot: usize,
+    sid: u32,
+    key: Arc<str>,
+    path: PathBuf,
+    rel: RelPath,
+    display: String,
+    size: u64,
+    mtime: Option<i64>,
+    readonly: bool,
+    compress: bool,
+}
+
+struct Done {
+    work: Work,
+    outcome: Result<FileOutcome>,
+}
+
+fn default_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(1))
+        .unwrap_or(2)
+        .clamp(1, 3)
 }
 
 #[derive(Clone, Copy)]
 enum Known {
     Parent(ObjectHash),
-    Resumed { hash: ObjectHash, new_object: bool },
+    Resumed {
+        hash: ObjectHash,
+        new_object: bool,
+        stored_size: u64,
+    },
 }
 
 impl Known {
@@ -374,7 +526,12 @@ impl Known {
 }
 
 enum FileOutcome {
-    Stored(Entry),
+    /// `packed`: stored in the open pack; durable only after the pack is committed.
+    Stored {
+        entry: Entry,
+        stored: StoredObject,
+        packed: bool,
+    },
     Skip(SkipReason, Option<String>),
     Vanished,
 }
@@ -392,7 +549,7 @@ impl Job<'_> {
 
     fn scan_source(&mut self, root: &ValidRoot) -> Result<()> {
         let sid = root.root.id;
-        let key = source_key(&root.path);
+        let key: Arc<str> = source_key(&root.path).into();
         let meta = fs::metadata(&root.path).ctx("read source folder", &root.path)?;
         self.push_dir(sid, RelPath::root(), &meta);
 
@@ -454,17 +611,21 @@ impl Job<'_> {
                         self.push_dir(sid, child_rel.clone(), &meta);
                         subdirs.push((path, child_rel));
                     }
-                    FileClass::Regular => match self.backup_file(&key, sid, &path, &child_rel)? {
-                        FileOutcome::Stored(e) => {
-                            self.stats.files += 1;
-                            self.stats.bytes += e.size;
-                            self.entries.push(e);
-                        }
-                        FileOutcome::Skip(reason, detail) => {
-                            self.skip(sid, display, reason, detail)
-                        }
-                        FileOutcome::Vanished => {}
-                    },
+                    FileClass::Regular => {
+                        let compress = self.compress && worth_compressing(name_str);
+                        self.handle_file(Work {
+                            slot: 0,
+                            sid,
+                            key: key.clone(),
+                            path,
+                            rel: child_rel,
+                            display,
+                            size: meta.len(),
+                            mtime: mtime_ms(&meta),
+                            readonly: meta.permissions().readonly(),
+                            compress,
+                        })?;
+                    }
                     FileClass::Link => self.skip(sid, display, SkipReason::ReparsePoint, None),
                     FileClass::CloudPlaceholder => {
                         self.skip(sid, display, SkipReason::CloudPlaceholder, None)
@@ -552,12 +713,13 @@ impl Job<'_> {
         (r.size == size && r.mtime == mtime).then_some(Known::Resumed {
             hash: r.hash,
             new_object: r.new,
+            stored_size: r.stored,
         })
     }
 
     fn push_dir(&mut self, source: u32, path: RelPath, meta: &fs::Metadata) {
         self.stats.dirs += 1;
-        self.entries.push(Entry {
+        self.entries.push(Some(Entry {
             source,
             path,
             kind: EntryKind::Dir,
@@ -565,133 +727,204 @@ impl Job<'_> {
             modified_ms: mtime_ms(meta),
             hash: None,
             readonly: false,
-        });
+        }));
     }
 
-    fn backup_file(
-        &mut self,
-        source_key: &str,
-        sid: u32,
-        path: &Path,
-        rel: &RelPath,
-    ) -> Result<FileOutcome> {
-        // Retry once if the file changes while we read it.
-        for attempt in 0..2 {
-            let before = match fs::symlink_metadata(path) {
-                Ok(m) => m,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(FileOutcome::Vanished),
-                Err(e) => {
-                    let (r, d) = classify_io(&e);
-                    return Ok(FileOutcome::Skip(r, d));
-                }
-            };
-            let size = before.len();
-            let mtime = mtime_ms(&before);
-            let readonly = before.permissions().readonly();
-
-            if !self.rehash_all
-                && let Some(m) = mtime
-                && let Some(known) = self.known(source_key, rel, size, m)
-                && self.writer.repo().has_object(&known.hash(), size)
-            {
-                let hash = known.hash();
-                match known {
-                    Known::Parent(_) => self.files_unchanged += 1,
-                    // Stored by the interrupted run: new relative to the parent snapshot.
-                    Known::Resumed { new_object, .. } => {
-                        self.files_copied += 1;
-                        if new_object {
-                            self.stats.new_objects += 1;
-                            self.stats.new_bytes += size;
-                        }
+    /// Records an unchanged file directly, or queues it for a copy worker.
+    fn handle_file(&mut self, mut w: Work) -> Result<()> {
+        if !self.rehash_all
+            && let Some(m) = w.mtime
+            && let Some(known) = self.known(&w.key, &w.rel, w.size, m)
+            && self.writer.repo().has_object(&known.hash(), w.size)
+        {
+            match known {
+                Known::Parent(_) => self.files_unchanged += 1,
+                // Stored by the interrupted run: new relative to the parent snapshot.
+                Known::Resumed {
+                    new_object,
+                    stored_size,
+                    ..
+                } => {
+                    self.files_copied += 1;
+                    if new_object {
+                        self.stats.new_objects += 1;
+                        self.stats.new_bytes += w.size;
+                        self.stats.new_stored_bytes += stored_size;
                     }
                 }
-                self.report(rel);
-                return Ok(FileOutcome::Stored(Entry {
-                    source: sid,
-                    path: rel.clone(),
-                    kind: EntryKind::File,
-                    size,
-                    modified_ms: mtime,
-                    hash: Some(hash),
-                    readonly,
-                }));
             }
-
-            let remaining = self.bytes_needed.saturating_sub(self.stats.new_bytes);
-            self.space.ensure(size, remaining)?;
-            let mut file = match File::open(path) {
-                Ok(f) => f,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(FileOutcome::Vanished),
-                Err(e) => {
-                    let (r, d) = classify_io(&e);
-                    return Ok(FileOutcome::Skip(r, d));
-                }
-            };
-            let mut bytes = 0u64;
-            let stored = match self
-                .writer
-                .store_object(&mut file, self.cancel, &mut |n| bytes += n)
-            {
-                Ok(o) => o,
-                Err(StoreError::Source(e)) => {
-                    let (r, d) = classify_io(&e);
-                    return Ok(FileOutcome::Skip(r, d));
-                }
-                Err(StoreError::Repo(e)) => return Err(e),
-            };
-            drop(file);
-            self.bytes_done += bytes;
-
-            let after = fs::symlink_metadata(path).ok();
-            let unchanged = after
-                .as_ref()
-                .is_some_and(|a| a.len() == size && mtime_ms(a) == mtime && stored.size == size);
-            if !unchanged {
-                if attempt == 0 {
-                    continue;
-                }
-                return Ok(FileOutcome::Skip(
-                    SkipReason::ChangedDuringRead,
-                    Some("file was being modified; it will be retried next backup".into()),
-                ));
-            }
-            if stored.is_new {
-                self.stats.new_objects += 1;
-                self.stats.new_bytes += stored.size;
-                self.space.written_since += stored.size;
-            }
-            if let (Some(j), Some(m)) = (self.journal.as_mut(), mtime) {
-                j.append(&checkpoint::Record {
-                    s: source_key.to_owned(),
-                    p: rel.clone(),
-                    size: stored.size,
-                    mtime: m,
-                    hash: stored.hash,
-                    new: stored.is_new,
-                })?;
-            }
-            self.files_copied += 1;
-            self.report(rel);
-            return Ok(FileOutcome::Stored(Entry {
-                source: sid,
-                path: rel.clone(),
+            self.stats.files += 1;
+            self.stats.bytes += w.size;
+            self.report(&w.rel);
+            self.entries.push(Some(Entry {
+                source: w.sid,
+                path: w.rel,
                 kind: EntryKind::File,
-                size: stored.size,
-                modified_ms: mtime,
-                hash: Some(stored.hash),
-                readonly,
+                size: w.size,
+                modified_ms: w.mtime,
+                hash: Some(known.hash()),
+                readonly: w.readonly,
             }));
+            return self.drain(false);
         }
-        unreachable!("loop returns on second attempt")
+
+        let remaining = self.bytes_needed.saturating_sub(self.dispatched_bytes);
+        self.space.ensure(w.size, remaining)?;
+        self.space.written_since += w.size;
+        self.dispatched_bytes += w.size;
+        w.slot = self.entries.len();
+        self.entries.push(None);
+        let pool = self.pool.as_mut().expect("workers running");
+        let lane = if w.size >= BIG_FILE {
+            &pool.big
+        } else {
+            &pool.small
+        };
+        // Workers only stop after the queues close, so a full queue drains.
+        lane.send(w).map_err(|_| Error::Io {
+            context: "backup workers stopped".into(),
+            source: io::Error::other("worker channel closed"),
+        })?;
+        pool.in_flight += 1;
+        self.drain(false)
+    }
+
+    /// Processes finished copies. With `wait`, blocks until every queued file is done.
+    fn drain(&mut self, wait: bool) -> Result<()> {
+        loop {
+            let pool = self.pool.as_mut().expect("workers running");
+            if pool.in_flight == 0 {
+                return Ok(());
+            }
+            let d = if wait {
+                match pool.done.recv_timeout(PROGRESS_TICK) {
+                    Ok(d) => d,
+                    Err(RecvTimeoutError::Timeout) => {
+                        self.cancel.check()?;
+                        self.maybe_flush_packs()?;
+                        // Keep the progress bar moving during long files.
+                        (self.progress)(self.event(JobPhase::Copying, self.files_done(), None));
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => return Ok(()),
+                }
+            } else {
+                match pool.done.try_recv() {
+                    Ok(d) => d,
+                    Err(_) => return Ok(()),
+                }
+            };
+            pool.in_flight -= 1;
+            self.finish(d)?;
+        }
+    }
+
+    fn finish(&mut self, d: Done) -> Result<()> {
+        let Done { work: w, outcome } = d;
+        match outcome {
+            Err(e) => Err(self.explain_repo_error(e)),
+            Ok(FileOutcome::Stored {
+                entry,
+                stored,
+                packed,
+            }) => {
+                if stored.is_new {
+                    self.stats.new_objects += 1;
+                    self.stats.new_bytes += stored.size;
+                    self.stats.new_stored_bytes += stored.stored_size;
+                }
+                self.journal(&w, &stored, packed)?;
+                self.maybe_flush_packs()?;
+                self.files_copied += 1;
+                self.stats.files += 1;
+                self.stats.bytes += entry.size;
+                self.report(&w.rel);
+                self.entries[w.slot] = Some(entry);
+                Ok(())
+            }
+            Ok(FileOutcome::Skip(reason, detail)) => {
+                self.skip(w.sid, w.display, reason, detail);
+                Ok(())
+            }
+            Ok(FileOutcome::Vanished) => Ok(()),
+        }
+    }
+
+    /// After a failure: keep the resume journal complete for files that did get stored.
+    fn journal_only(&mut self, d: Done) {
+        if let Ok(FileOutcome::Stored { stored, packed, .. }) = &d.outcome {
+            let _ = self.journal(&d.work, stored, *packed);
+        }
+    }
+
+    /// Records a stored file in the resume journal. Packed files wait for their pack commit.
+    fn journal(&mut self, w: &Work, stored: &StoredObject, packed: bool) -> Result<()> {
+        let Some(m) = w.mtime else { return Ok(()) };
+        let rec = checkpoint::Record {
+            s: w.key.to_string(),
+            p: w.rel.clone(),
+            size: stored.size,
+            mtime: m,
+            hash: stored.hash,
+            new: stored.is_new,
+            stored: stored.stored_size,
+        };
+        if packed {
+            self.unflushed.push(rec);
+        } else if let Some(j) = self.journal.as_mut() {
+            j.append(&rec)?;
+        }
+        Ok(())
+    }
+
+    /// Commits the open pack now and then, so the journal covers small files too.
+    fn maybe_flush_packs(&mut self) -> Result<()> {
+        if self.unflushed.is_empty()
+            || (self.unflushed.len() < PACK_FLUSH_FILES
+                && self.last_pack_flush.elapsed() < PACK_FLUSH_EVERY)
+        {
+            return Ok(());
+        }
+        self.writer.flush_pack()?;
+        self.last_pack_flush = Instant::now();
+        self.journal_unflushed()
+    }
+
+    /// Only call right after a successful `flush_pack`.
+    fn journal_unflushed(&mut self) -> Result<()> {
+        if let Some(j) = self.journal.as_mut() {
+            for rec in self.unflushed.drain(..) {
+                j.append(&rec)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A full disk reported by the OS mid-write becomes the friendly "not enough space" error.
+    fn explain_repo_error(&mut self, e: Error) -> Error {
+        let full = matches!(&e, Error::Io { source, .. }
+            if source.kind() == io::ErrorKind::StorageFull
+                || matches!(source.raw_os_error(), Some(112) | Some(28)));
+        if full {
+            let available = self.space.refresh().min(u64::MAX / 2);
+            Error::InsufficientSpace {
+                needed: self
+                    .bytes_needed
+                    .saturating_sub(self.stats.new_bytes)
+                    .saturating_add(self.space.reserve),
+                available,
+            }
+        } else {
+            e
+        }
+    }
+
+    fn files_done(&self) -> u64 {
+        self.files_copied + self.files_unchanged
     }
 
     fn report(&self, rel: &RelPath) {
-        (self.progress)(self.event(
-            JobPhase::Copying,
-            self.files_copied + self.files_unchanged,
-            Some(rel.to_string()),
-        ));
+        (self.progress)(self.event(JobPhase::Copying, self.files_done(), Some(rel.to_string())));
     }
 
     fn event(&self, phase: JobPhase, files: u64, path: Option<String>) -> ProgressEvent {
@@ -699,11 +932,128 @@ impl Job<'_> {
             phase,
             files_done: files,
             files_total: self.files_total,
-            bytes_done: self.bytes_done,
+            bytes_done: self.bytes_read.load(Ordering::Relaxed),
             bytes_total: self.bytes_total,
             current_path: path,
         }
     }
+}
+
+/// Copy thread: takes files from its lane until the queue closes.
+fn copy_worker(
+    writer: &RepoWriter,
+    rx: Arc<Mutex<Receiver<Work>>>,
+    done: Sender<Done>,
+    abort: &CancelToken,
+    bytes_read: &AtomicU64,
+) {
+    loop {
+        let next = rx.lock().map(|r| r.recv());
+        let Ok(Ok(work)) = next else { return };
+        let outcome = if abort.is_cancelled() {
+            Err(Error::Cancelled)
+        } else {
+            copy_file(writer, &work, abort, bytes_read)
+        };
+        if done.send(Done { work, outcome }).is_err() {
+            return;
+        }
+    }
+}
+
+/// Reads one source file into the repository. Source problems skip the file; repository
+/// problems are errors. Retries once if the file changes while being read.
+fn copy_file(
+    writer: &RepoWriter,
+    w: &Work,
+    cancel: &CancelToken,
+    bytes_read: &AtomicU64,
+) -> Result<FileOutcome> {
+    let (mut size, mut mtime, mut readonly) = (w.size, w.mtime, w.readonly);
+    for attempt in 0..2 {
+        if attempt > 0 {
+            match fs::symlink_metadata(&w.path) {
+                Ok(m) => {
+                    (size, mtime, readonly) = (m.len(), mtime_ms(&m), m.permissions().readonly())
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(FileOutcome::Vanished),
+                Err(e) => {
+                    let (r, d) = classify_io(&e);
+                    return Ok(FileOutcome::Skip(r, d));
+                }
+            }
+        }
+        let mut file = match File::open(&w.path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(FileOutcome::Vanished),
+            Err(e) => {
+                let (r, d) = classify_io(&e);
+                return Ok(FileOutcome::Skip(r, d));
+            }
+        };
+        let packed = size < SMALL_OBJECT;
+        let stored = if packed {
+            // Small file: read it whole (one byte extra to notice growth), then pack it.
+            cancel.check()?;
+            let mut data = Vec::with_capacity(size as usize + 1);
+            if let Err(e) = (&mut file).take(SMALL_OBJECT).read_to_end(&mut data) {
+                let (r, d) = classify_io(&e);
+                return Ok(FileOutcome::Skip(r, d));
+            }
+            bytes_read.fetch_add(data.len() as u64, Ordering::Relaxed);
+            if data.len() as u64 != size {
+                // Changed while reading: the size check below retries or skips it.
+                StoredObject {
+                    hash: k92_core::ObjectHash([0; 32]),
+                    size: data.len() as u64,
+                    is_new: false,
+                    stored_size: 0,
+                }
+            } else {
+                writer.store_small(&data, w.compress)?
+            }
+        } else {
+            match writer.store_object(&mut file, w.compress, cancel, &mut |n| {
+                bytes_read.fetch_add(n, Ordering::Relaxed);
+            }) {
+                Ok(o) => o,
+                Err(StoreError::Source(e)) => {
+                    let (r, d) = classify_io(&e);
+                    return Ok(FileOutcome::Skip(r, d));
+                }
+                Err(StoreError::Repo(e)) => return Err(e),
+            }
+        };
+        drop(file);
+
+        let after = fs::symlink_metadata(&w.path).ok();
+        let unchanged = after
+            .as_ref()
+            .is_some_and(|a| a.len() == size && mtime_ms(a) == mtime && stored.size == size);
+        if !unchanged {
+            if attempt == 0 {
+                continue;
+            }
+            return Ok(FileOutcome::Skip(
+                SkipReason::ChangedDuringRead,
+                Some("file was being modified; it will be retried next backup".into()),
+            ));
+        }
+        return Ok(FileOutcome::Stored {
+            entry: Entry {
+                source: w.sid,
+                path: w.rel.clone(),
+                kind: EntryKind::File,
+                size: stored.size,
+                modified_ms: mtime,
+                hash: Some(stored.hash),
+                readonly,
+            },
+            stored,
+            packed,
+        });
+    }
+    unreachable!("loop returns on second attempt")
 }
 
 fn event(phase: JobPhase, files: u64, bytes: u64, path: Option<String>) -> ProgressEvent {

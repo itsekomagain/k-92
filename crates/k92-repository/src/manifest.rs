@@ -160,6 +160,9 @@ pub struct SnapshotStats {
     /// Files and folders left out by exclusion rules (added in 0.1; absent in older manifests).
     #[serde(default)]
     pub excluded: u64,
+    /// Bytes `new_bytes` took on the backup drive after compression (absent before v2).
+    #[serde(default)]
+    pub new_stored_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

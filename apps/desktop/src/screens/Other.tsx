@@ -242,6 +242,21 @@ export function SettingsScreen({ theme, setTheme }: { theme: Theme; setTheme: (t
         <ExclusionsCard settings={s} save={save} />
 
         <div className="card stack">
+          <h2>Storage</h2>
+          <label className="row" style={{ alignItems: "flex-start", cursor: "pointer" }}>
+            <input type="checkbox" style={{ marginTop: 3, accentColor: "var(--accent)" }} checked={s.compress}
+              onChange={(e) => void save(api.updateSettings({ ...s, compress: e.target.checked }))} />
+            <span className="stack" style={{ gap: 2 }}>
+              <span>Compress backups (recommended)</span>
+              <span className="small faint">
+                Documents, spreadsheets and other text typically take half the space or less. Photos, videos and zip files are
+                already compressed and are stored as they are. Backups stay readable either way.
+              </span>
+            </span>
+          </label>
+        </div>
+
+        <div className="card stack">
           <h2>Appearance</h2>
           <div className="row" role="radiogroup" aria-label="Theme">
             {(["system", "light", "dark"] as const).map((t) => (

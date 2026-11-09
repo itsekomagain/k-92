@@ -17,4 +17,8 @@ filesRemoved: number,
 /**
  * Files and folders left out by exclusion rules.
  */
-excluded: number, newObjects: number, newBytes: number, skipped: Array<SkippedItemDto>, durationMs: number, };
+excluded: number, newObjects: number, newBytes: number, 
+/**
+ * Space `new_bytes` took on the backup drive after compression.
+ */
+newStoredBytes: number, skipped: Array<SkippedItemDto>, durationMs: number, };

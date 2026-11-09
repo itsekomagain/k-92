@@ -48,11 +48,11 @@ Engine work and tests run anywhere: `cargo test`. To type-check the Windows code
 
 ```sh
 rustup target add x86_64-pc-windows-msvc
-cargo check --target x86_64-pc-windows-msvc -p k92-cli -p k92-windows --features k92-repository/pure-hash
+cargo clippy --target x86_64-pc-windows-msvc -p k92-windows -p k92-core
 ```
 
-The desktop crate cannot be fully built off Windows (its build embeds Windows resources with
-`rc.exe`); use the Windows CI job.
+Crates that use zstd (a C library) and the desktop crate (which embeds Windows resources with
+`rc.exe`) cannot be cross-compiled from macOS/Linux; the Windows CI job builds and tests them.
 
 ## Portable recovery
 

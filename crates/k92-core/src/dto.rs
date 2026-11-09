@@ -104,6 +104,9 @@ pub struct BackupReport {
     pub new_objects: u64,
     #[ts(type = "number")]
     pub new_bytes: u64,
+    /// Space `new_bytes` took on the backup drive after compression.
+    #[ts(type = "number")]
+    pub new_stored_bytes: u64,
     pub skipped: Vec<SkippedItemDto>,
     #[ts(type = "number")]
     pub duration_ms: u64,
@@ -305,6 +308,9 @@ pub struct AppSettings {
     #[serde(default)]
     #[ts(type = "number | null")]
     pub max_file_bytes: Option<u64>,
+    /// Store compressible files compressed (new backup drives only).
+    #[serde(default = "yes")]
+    pub compress: bool,
 }
 
 fn yes() -> bool {
@@ -319,6 +325,7 @@ impl Default for AppSettings {
             exclude: Vec::new(),
             skip_common_junk: true,
             max_file_bytes: None,
+            compress: true,
         }
     }
 }

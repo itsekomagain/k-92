@@ -3,7 +3,11 @@ use serde::{Deserialize, Serialize};
 use k92_core::{Error, Result};
 
 pub const REPO_FORMAT: &str = "k92-repository";
-pub const SUPPORTED_FORMAT_VERSION: u32 = 1;
+pub const SUPPORTED_FORMAT_VERSION: u32 = 2;
+/// v1: every object is stored raw.
+pub const ENCODING_RAW: &str = "raw";
+/// v2: each object is stored either raw (`<hash>`) or zstd-compressed (`<hash>.zst`).
+pub const ENCODING_RAW_ZSTD: &str = "raw+zstd";
 
 /// Contents of `k92-repository.json`. Written once at creation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -27,7 +31,7 @@ impl Descriptor {
             repository_id: uuid::Uuid::new_v4().to_string(),
             created_at: crate::now_rfc3339(),
             hash_algorithm: "blake3".into(),
-            object_encoding: "raw".into(),
+            object_encoding: ENCODING_RAW_ZSTD.into(),
             encryption: None,
         }
     }
@@ -46,7 +50,11 @@ impl Descriptor {
                 self.format_version, SUPPORTED_FORMAT_VERSION
             )));
         }
-        if self.hash_algorithm != "blake3" || self.object_encoding != "raw" {
+        let encoding_ok = match self.format_version {
+            1 => self.object_encoding == ENCODING_RAW,
+            _ => [ENCODING_RAW, ENCODING_RAW_ZSTD].contains(&self.object_encoding.as_str()),
+        };
+        if self.hash_algorithm != "blake3" || !encoding_ok {
             return Err(Error::Unsupported(format!(
                 "hash {:?} / encoding {:?}",
                 self.hash_algorithm, self.object_encoding
@@ -59,6 +67,13 @@ impl Descriptor {
             return Err(Error::Corrupt("invalid repositoryId".into()));
         }
         Ok(())
+    }
+}
+
+impl Descriptor {
+    /// New objects may be written compressed.
+    pub fn supports_compression(&self) -> bool {
+        self.object_encoding == ENCODING_RAW_ZSTD
     }
 }
 

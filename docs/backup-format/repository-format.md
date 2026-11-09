@@ -1,4 +1,4 @@
-# K-92 Repository Format, version 1
+# K-92 Repository Format, version 2
 
 Status: implemented (`crates/k92-repository`). This document is the source of truth.
 If code and document disagree, that is a bug.
@@ -13,7 +13,8 @@ needed. A fresh K-92 install (or the portable `k92` CLI) can open any repository
 <destination>/K-92 Backup/
   k92-repository.json          repository descriptor (written once, never modified)
   README.txt                   plain-text explanation for humans
-  objects/<aa>/<64 hex>        content blobs, named by BLAKE3 of their bytes
+  objects/<aa>/<64 hex>[.zst]  larger file contents (≥ 1 MiB), named by BLAKE3 of the original bytes
+  packs/<id>.pack, <id>.idx    small file contents (< 1 MiB) bundled together, plus their index
   snapshots/<snapshot-id>.json committed snapshot manifests
   staging/                     scratch area for in-progress writes (never referenced)
   checkpoint.jsonl             progress journal of an unfinished backup (optional, advisory)
@@ -27,29 +28,53 @@ needed. A fresh K-92 install (or the portable `k92` CLI) can open any repository
 ```json
 {
   "format": "k92-repository",
-  "formatVersion": 1,
+  "formatVersion": 2,
   "repositoryId": "6f1c0e0e-…",
   "createdAt": "2026-11-09T10:30:00.000Z",
   "hashAlgorithm": "blake3",
-  "objectEncoding": "raw",
+  "objectEncoding": "raw+zstd",
   "encryption": null
 }
 ```
 
 * Readers **must refuse** a repository whose `formatVersion` is greater than they support
   or whose `hashAlgorithm` / `objectEncoding` / `encryption` they do not understand.
-* `objectEncoding` and `encryption` exist so a future version can add compression and
-  AES-256-GCM authenticated encryption without changing the layout. Version 1 stores raw bytes.
+* Version 1 (`objectEncoding: "raw"`): every object is a raw file under `objects/`; no packs.
+  Version 2 readers still read v1 repositories and keep writing raw objects into them.
+* Version 2 (`objectEncoding: "raw+zstd"`): objects may be zstd-compressed, and small objects
+  live in packs. New repositories are created as version 2.
+* `encryption` is reserved for AES-256-GCM authenticated encryption (not yet implemented).
 
 ## 3. Objects
 
-* An object is the complete content of one file version (file-level, no chunking in v1).
-* Path: `objects/<first 2 hex>/<64 hex BLAKE3>`. Identical content is stored once.
-* Written as: stream into `staging/<random>.tmp` while hashing → `fsync` → rename to
-  final path (skipped if an identical object already exists) → `fsync` parent directory
-  where the platform supports it.
-* Readers verify the BLAKE3 hash while streaming. A mismatch is reported as corruption
-  and the restored output is discarded.
+* An object is the complete content of one file version (file-level, no chunking yet).
+  It is named by the BLAKE3 hash of the **original** bytes, so identical content is stored
+  once whatever its encoding.
+* **Encoding.** If the first 256 KiB of a file compress by at least 10% (zstd level 1 test),
+  the object is stored zstd-compressed (level 3); otherwise raw. Files under 4 KiB and
+  known-compressed types (jpg, mp4, zip, docx, …) are stored raw.
+* **Large objects (≥ 1 MiB)**: `objects/<first 2 hex>/<64 hex>` (raw) or the same name with
+  `.zst` (compressed). Written as: stream into `staging/<random>.tmp` while hashing → `fsync`
+  → rename to final path (skipped if an identical object already exists) → `fsync` parent
+  directory where the platform supports it.
+* **Small objects (< 1 MiB)** go into packs (§3a) so that many small files need one disk flush
+  per pack instead of one per file.
+* Readers verify the BLAKE3 hash of the decoded bytes while streaming. A mismatch or a
+  decoding error is reported as corruption and the restored output is discarded.
+
+## 3a. Packs
+
+* `packs/<32 hex id>.pack`: object blobs back to back (each raw or a zstd frame).
+* `packs/<32 hex id>.idx`: `{"checksum":"blake3:<hex of body>","body":{"format":"k92-pack-index",
+  "packId","packSize","entries":[{"hash","offset","len","size","encoding":"raw"|"zstd"}]}}`.
+* Written as: append blobs to `staging/<id>.pack.tmp` → `fsync` → rename into `packs/` →
+  write the index atomically (staging, `fsync`, rename). **The index is the commit point**: a
+  `.pack` without `.idx` is ignored by readers and deleted by cleanup.
+* A pack is committed when it reaches 32 MiB, every 15 s or 5,000 files during a backup, and
+  always before a snapshot manifest is committed (I3).
+* Indexes are untrusted: the checksum must match, `packId` must equal the file name,
+  `packSize` must equal the actual pack size, and every entry must lie inside the pack. A pack
+  that fails these checks is reported as damaged; its objects show as missing in `verify`.
 
 ## 4. Snapshot manifests
 
@@ -98,14 +123,14 @@ The file is a JSON envelope whose checksum covers the **exact bytes** of the bod
 
 | # | Invariant |
 |---|-----------|
-| I1 | The bytes of `objects/xx/H` always hash to `H`. Objects are only created by atomic rename of a fully written, fsynced staging file. |
+| I1 | The decoded bytes of object `H` (loose or packed) always hash to `H`. Loose objects and packs are only created by atomic rename of a fully written, fsynced staging file; a pack becomes visible only when its index is written afterwards. |
 | I2 | A snapshot is committed **iff** `snapshots/<id>.json` exists and its checksum is valid. Partial or corrupt manifests are never shown as successful snapshots. |
 | I3 | Every object referenced by a committed manifest was durably written before that manifest was renamed into place. |
 | I4 | Committed manifests and objects are never modified in place. |
 | I5 | Nothing references `staging/`. A writer holding the lock may empty it at any time. |
 | I6 | At most one writer (backup, prune, GC) runs at a time, enforced by an OS file lock on `lock`. Readers need no lock. |
 | I7 | All manifest contents are untrusted: ids, paths and hashes are validated before use, and restore never writes outside the chosen destination. |
-| I8 | Garbage collection deletes an object only if no committed manifest references it. If **any** manifest cannot be read, GC deletes nothing. |
+| I8 | Garbage collection deletes an object only if no committed manifest references it. If **any** manifest cannot be read, GC deletes nothing. A pack is deleted only when none of its objects is referenced (index first, then pack); packs with a damaged index are never deleted. |
 | I9 | Retention deletes snapshot manifests only; space is reclaimed by a later GC pass. A failed operation never deletes a valid snapshot. |
 | I10 | `checkpoint.jsonl` is never part of a snapshot and nothing depends on it. A record is appended only after its object is durable, and is used only if that object still exists with the recorded size and the source file's size and modified time still match. Damaged or foreign lines are ignored; deleting the file only costs re-reading. |
 
@@ -124,6 +149,7 @@ the backup then simply reads those files again.
 | Interrupted during | Result after restart |
 |--------------------|----------------------|
 | object write | stray file in `staging/` (cleaned on next write session); no visible change |
+| pack write | unfinished pack in `staging/` (cleaned), or a `.pack` without `.idx` (ignored; deleted by cleanup); its small files are read again next time |
 | after some objects, before manifest | unreferenced but valid objects plus `checkpoint.jsonl`; the next backup skips files already stored (I10) and GC can reclaim the objects otherwise |
 | destination full | backup stops with "not enough space" before or during copying; nothing committed; progress kept in the checkpoint |
 | manifest write | stray staging file; snapshot not visible (I2) |
@@ -141,6 +167,8 @@ the backup then simply reads those files again.
 * Single JSON manifest per snapshot: fine for ≈10⁵–10⁶ files; very large trees need split
   manifests (planned).
 * Whole-file objects: a 1-byte change to a 20 GB file stores 20 GB again (chunking planned).
+* Packs whose objects are only partly still in use are kept whole; reclaiming that space
+  needs a repack step (planned).
 * Not preserved: NTFS ACLs, alternate data streams, EFS encryption, sparse/compressed
   attributes, hard-link identity, reparse points (junctions/symlinks are skipped and reported).
 * Preserved: content, relative path, last-modified time, read-only attribute, empty directories.

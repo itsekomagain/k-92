@@ -3,13 +3,15 @@
 pub mod descriptor;
 mod fsutil;
 pub mod manifest;
+pub mod pack;
 pub mod retention;
 mod verify;
 
 use std::collections::HashSet;
 use std::fs::{self, File, TryLockError};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 
 use chrono::{SecondsFormat, Utc};
 
@@ -18,11 +20,20 @@ use k92_core::{CancelToken, Error, IoContext, ObjectHash, Result};
 
 pub use descriptor::Descriptor;
 pub use manifest::{Entry, HostInfo, Snapshot, SnapshotId, SourceRoot};
+pub use pack::SMALL_OBJECT;
+
+use pack::{Encoding, OpenPack, PackIndex, PackLoc};
 
 /// Folder created inside the user's chosen destination.
 pub const REPO_DIR_NAME: &str = "K-92 Backup";
 const DESCRIPTOR_FILE: &str = "k92-repository.json";
 const IO_BUF: usize = 1024 * 1024;
+/// Files smaller than this are stored raw: compressing them cannot save a disk cluster.
+const MIN_COMPRESS_SIZE: usize = 4096;
+/// The start of each file is test-compressed; at most this much is used.
+const COMPRESS_SAMPLE: usize = 256 * 1024;
+/// zstd level: about 3x faster than a USB hard drive can write, on one core.
+const ZSTD_LEVEL: i32 = 3;
 
 pub(crate) fn now_rfc3339() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
@@ -37,8 +48,8 @@ To restore files without the K-92 app, use the portable `k92` tool:
     k92 snapshots --repo \"<this folder>\"
     k92 restore --repo \"<this folder>\" --snapshot latest --path \"<file or folder>\" --to <folder>
 
-Layout: objects/ holds file contents named by their BLAKE3 hash, snapshots/ holds one
-JSON manifest per backup. The format is documented in the K-92 source repository under
+Layout: objects/ holds larger file contents named by their BLAKE3 hash, packs/ holds
+small files bundled together, snapshots/ holds one JSON manifest per backup. The format is documented in the K-92 source repository under
 docs/backup-format/repository-format.md.
 ";
 
@@ -47,6 +58,8 @@ docs/backup-format/repository-format.md.
 pub struct Repository {
     root: PathBuf,
     descriptor: Descriptor,
+    /// Pack indexes, loaded on first use and shared between clones.
+    packs: Arc<RwLock<Option<PackIndex>>>,
 }
 
 /// Outcome of storing one object.
@@ -56,6 +69,16 @@ pub struct StoredObject {
     pub size: u64,
     /// False if identical content was already in the repository.
     pub is_new: bool,
+    /// Bytes written to the backup drive for a new object (smaller than `size` if compressed).
+    pub stored_size: u64,
+}
+
+/// Where and how an object is stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectFile {
+    Raw { path: PathBuf, len: u64 },
+    Zstd { path: PathBuf, len: u64 },
+    Packed { path: PathBuf, loc: PackLoc },
 }
 
 /// Distinguishes problems reading the *source* (skip the file, keep going) from
@@ -79,7 +102,7 @@ impl Repository {
                 dest.display()
             )));
         }
-        for d in ["", "objects", "snapshots", "staging"] {
+        for d in ["", "objects", "packs", "snapshots", "staging"] {
             fs::create_dir_all(root.join(d)).ctx("create", &root.join(d))?;
         }
         let staging = root.join("staging");
@@ -89,7 +112,7 @@ impl Repository {
         // The descriptor is the commit point of repository creation.
         fsutil::write_atomic(&staging, &root.join(DESCRIPTOR_FILE), &json)?;
         tracing::info!(root = %root.display(), id = %descriptor.repository_id, "created repository");
-        Ok(Repository { root, descriptor })
+        Ok(Repository::new(root, descriptor))
     }
 
     /// Opens a repository given either its own folder or the folder that contains `K-92 Backup`.
@@ -120,7 +143,54 @@ impl Repository {
                 return Err(Error::Corrupt(format!("missing {d}/ folder")));
             }
         }
-        Ok(Repository { root, descriptor })
+        Ok(Repository::new(root, descriptor))
+    }
+
+    fn new(root: PathBuf, descriptor: Descriptor) -> Self {
+        Repository {
+            root,
+            descriptor,
+            packs: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    fn packs_dir(&self) -> PathBuf {
+        self.root.join("packs")
+    }
+
+    /// Runs `f` on the pack index, loading it from disk the first time.
+    fn with_packs<R>(&self, f: impl FnOnce(&PackIndex) -> R) -> R {
+        if let Some(idx) = self
+            .packs
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            return f(idx);
+        }
+        let mut w = self.packs.write().unwrap_or_else(|p| p.into_inner());
+        let idx = w.get_or_insert_with(|| PackIndex::load(&self.packs_dir()));
+        f(idx)
+    }
+
+    fn with_packs_mut<R>(&self, f: impl FnOnce(&mut PackIndex) -> R) -> R {
+        let mut w = self.packs.write().unwrap_or_else(|p| p.into_inner());
+        let idx = w.get_or_insert_with(|| PackIndex::load(&self.packs_dir()));
+        f(idx)
+    }
+
+    /// Forgets the cached pack index (it is re-read on next use).
+    fn reload_packs(&self) {
+        *self.packs.write().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    pub fn pack_location(&self, hash: &ObjectHash) -> Option<PackLoc> {
+        self.with_packs(|p| p.objects.get(hash).cloned())
+    }
+
+    /// Packs whose index could not be read: (pack id, problem).
+    pub fn damaged_packs(&self) -> Vec<(String, String)> {
+        self.with_packs(|p| p.damaged.clone())
     }
 
     /// Returns `Some(path)` if `dest` (or `dest/K-92 Backup`) holds a repository.
@@ -159,9 +229,53 @@ impl Repository {
         self.root.join("objects").join(&hex[..2]).join(hex)
     }
 
-    /// True if the object exists with the expected size (cheap check; no hashing).
+    pub fn compressed_object_path(&self, hash: &ObjectHash) -> PathBuf {
+        self.object_path(hash).with_extension("zst")
+    }
+
+    /// Finds an object on disk. A raw copy with the right size wins; otherwise a compressed
+    /// copy; otherwise whatever raw file exists (so a wrong-size raw file shows as damaged).
+    pub fn locate_object(&self, hash: &ObjectHash, size: u64) -> Option<ObjectFile> {
+        if let Some(loc) = self.pack_location(hash) {
+            return Some(ObjectFile::Packed {
+                path: pack::pack_path(&self.packs_dir(), &loc.pack_id),
+                loc,
+            });
+        }
+        let raw = self.object_path(hash);
+        let raw_len = fs::metadata(&raw)
+            .ok()
+            .filter(|m| m.is_file())
+            .map(|m| m.len());
+        if raw_len == Some(size) {
+            return Some(ObjectFile::Raw {
+                path: raw,
+                len: size,
+            });
+        }
+        let zst = self.compressed_object_path(hash);
+        if let Some(m) = fs::metadata(&zst).ok().filter(|m| m.is_file()) {
+            return Some(ObjectFile::Zstd {
+                path: zst,
+                len: m.len(),
+            });
+        }
+        raw_len.map(|len| ObjectFile::Raw { path: raw, len })
+    }
+
+    /// True if the object exists and looks intact (cheap check; no hashing).
     pub fn has_object(&self, hash: &ObjectHash, size: u64) -> bool {
-        fs::metadata(self.object_path(hash)).is_ok_and(|m| m.is_file() && m.len() == size)
+        match self.locate_object(hash, size) {
+            Some(ObjectFile::Raw { len, .. }) => len == size,
+            Some(ObjectFile::Zstd { len, .. }) => len > 0,
+            Some(ObjectFile::Packed { loc, .. }) => loc.size == size,
+            None => false,
+        }
+    }
+
+    /// New objects may be written compressed.
+    pub fn supports_compression(&self) -> bool {
+        self.descriptor.supports_compression()
     }
 
     /// Committed snapshot ids, oldest first. Files that are not valid snapshot names are ignored.
@@ -239,17 +353,51 @@ impl Repository {
         out: &mut dyn Write,
         cancel: &CancelToken,
     ) -> Result<u64> {
-        let p = self.object_path(hash);
-        let mut f = File::open(&p).map_err(|e| match e.kind() {
-            io::ErrorKind::NotFound => Error::Corrupt(format!("missing object {hash}")),
-            _ => Error::io_path("open", &p, e),
-        })?;
+        // A hash lives either in a pack (small files) or as its own file.
+        let raw = self.object_path(hash);
+        let zst = self.compressed_object_path(hash);
+        let (p, compressed, f): (PathBuf, bool, Box<dyn Read>) =
+            if let Some(loc) = self.pack_location(hash) {
+                let p = pack::pack_path(&self.packs_dir(), &loc.pack_id);
+                let mut f = File::open(&p).map_err(|e| match e.kind() {
+                    io::ErrorKind::NotFound => Error::Corrupt(format!("missing pack for {hash}")),
+                    _ => Error::io_path("open", &p, e),
+                })?;
+                f.seek(SeekFrom::Start(loc.offset)).ctx("read", &p)?;
+                (p, loc.encoding == Encoding::Zstd, Box::new(f.take(loc.len)))
+            } else if raw.is_file() {
+                let f = File::open(&raw).ctx("open", &raw)?;
+                (raw, false, Box::new(f))
+            } else if zst.is_file() {
+                let f = File::open(&zst).ctx("open", &zst)?;
+                (zst, true, Box::new(f))
+            } else {
+                return Err(Error::Corrupt(format!("missing object {hash}")));
+            };
+        let mut reader: Box<dyn Read> = if compressed {
+            Box::new(
+                zstd::stream::read::Decoder::new(f)
+                    .map_err(|e| Error::Corrupt(format!("object {hash}: {e}")))?,
+            )
+        } else {
+            Box::new(f)
+        };
         let mut hasher = blake3::Hasher::new();
         let mut buf = vec![0u8; IO_BUF];
         let mut total = 0u64;
         loop {
             cancel.check()?;
-            let n = f.read(&mut buf).ctx("read", &p)?;
+            let n = match reader.read(&mut buf) {
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                // Undecodable data in a file that is still there is damage, not an I/O problem.
+                Err(e) if compressed && p.is_file() => {
+                    return Err(Error::Corrupt(format!(
+                        "object {hash} cannot be decompressed: {e}"
+                    )));
+                }
+                Err(e) => return Err(Error::io_path("read", &p, e)),
+            };
             if n == 0 {
                 break;
             }
@@ -301,6 +449,7 @@ impl Repository {
         let w = RepoWriter {
             repo: self.clone(),
             _lock: f,
+            pack: Mutex::new(None),
         };
         w.clear_staging()?;
         Ok(w)
@@ -330,10 +479,19 @@ impl Repository {
 }
 
 /// Holds the writer lock. All mutations go through here.
-#[derive(Debug)]
 pub struct RepoWriter {
     repo: Repository,
     _lock: File,
+    /// Small objects collect here until the pack is full or flushed.
+    pack: Mutex<Option<OpenPack>>,
+}
+
+impl std::fmt::Debug for RepoWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RepoWriter")
+            .field("repo", &self.repo)
+            .finish()
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -341,6 +499,9 @@ pub struct GcReport {
     pub objects_deleted: u64,
     pub bytes_freed: u64,
     pub objects_kept: u64,
+    /// Packs kept because some of their objects are still used (space reclaimed by a later
+    /// repack, not yet implemented).
+    pub packs_partly_used: u64,
 }
 
 impl RepoWriter {
@@ -361,15 +522,18 @@ impl RepoWriter {
     }
 
     /// Streams `src` into the object store: hash + write to staging, fsync, rename (I1, I3).
+    /// With `compress`, data that compresses well is stored zstd-compressed (format v2 only).
     pub fn store_object(
         &self,
         src: &mut dyn Read,
+        compress: bool,
         cancel: &CancelToken,
         on_bytes: &mut dyn FnMut(u64),
     ) -> std::result::Result<StoredObject, StoreError> {
         let staging = self.repo.staging_dir();
         let tmp = fsutil::staging_file_path(&staging);
-        let result = self.store_inner(src, &tmp, cancel, on_bytes);
+        let compress = compress && self.repo.supports_compression();
+        let result = self.store_inner(src, &tmp, compress, cancel, on_bytes);
         if !matches!(result, Ok((_, true))) {
             let _ = fs::remove_file(&tmp);
         }
@@ -380,31 +544,54 @@ impl RepoWriter {
         &self,
         src: &mut dyn Read,
         tmp: &Path,
+        compress: bool,
         cancel: &CancelToken,
         on_bytes: &mut dyn FnMut(u64),
     ) -> std::result::Result<(StoredObject, bool), StoreError> {
         let repo_err = StoreError::Repo;
-        let mut out = File::create_new(tmp).ctx("create", tmp).map_err(repo_err)?;
-        let mut hasher = blake3::Hasher::new();
         let mut buf = vec![0u8; IO_BUF];
+        let mut hasher = blake3::Hasher::new();
         let mut size = 0u64;
+
+        // The first chunk decides the encoding.
+        cancel.check().map_err(repo_err)?;
+        let first = read_full(src, &mut buf).map_err(StoreError::Source)?;
+        let zstd_mode = compress
+            && first >= MIN_COMPRESS_SIZE
+            && worth_compressing(&buf[..first.min(COMPRESS_SAMPLE)]);
+
+        let file = File::create_new(tmp).ctx("create", tmp).map_err(repo_err)?;
+        let mut sink = if zstd_mode {
+            let mut enc = zstd::stream::write::Encoder::new(file, ZSTD_LEVEL)
+                .ctx("compress", tmp)
+                .map_err(repo_err)?;
+            enc.include_checksum(true)
+                .ctx("compress", tmp)
+                .map_err(repo_err)?;
+            Sink::Zstd(enc)
+        } else {
+            Sink::Raw(file)
+        };
+
+        let mut n = first;
         loop {
-            cancel.check().map_err(repo_err)?;
-            let n = match src.read(&mut buf) {
-                Ok(n) => n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(StoreError::Source(e)),
-            };
-            if n == 0 {
+            if n > 0 {
+                hasher.update(&buf[..n]);
+                sink.write_all(&buf[..n])
+                    .ctx("write", tmp)
+                    .map_err(repo_err)?;
+                size += n as u64;
+                on_bytes(n as u64);
+            }
+            if n < buf.len() {
+                // A short read from read_full means end of file.
                 break;
             }
-            hasher.update(&buf[..n]);
-            out.write_all(&buf[..n])
-                .ctx("write", tmp)
-                .map_err(repo_err)?;
-            size += n as u64;
-            on_bytes(n as u64);
+            cancel.check().map_err(repo_err)?;
+            n = read_full(src, &mut buf).map_err(StoreError::Source)?;
         }
+        let out = sink.finish().ctx("write", tmp).map_err(repo_err)?;
+
         let hash = ObjectHash(*hasher.finalize().as_bytes());
         if self.repo.has_object(&hash, size) {
             return Ok((
@@ -412,13 +599,19 @@ impl RepoWriter {
                     hash,
                     size,
                     is_new: false,
+                    stored_size: 0,
                 },
                 false,
             ));
         }
         out.sync_all().ctx("flush", tmp).map_err(repo_err)?;
+        let stored_size = out.metadata().map(|m| m.len()).unwrap_or(size);
         drop(out);
-        let dest = self.repo.object_path(&hash);
+        let dest = if zstd_mode {
+            self.repo.compressed_object_path(&hash)
+        } else {
+            self.repo.object_path(&hash)
+        };
         let parent = dest.parent().expect("object path has parent");
         fs::create_dir_all(parent)
             .ctx("create", parent)
@@ -427,15 +620,93 @@ impl RepoWriter {
         fsutil::rename_with_retry(tmp, &dest)
             .ctx("store", &dest)
             .map_err(repo_err)?;
+        if zstd_mode {
+            // A damaged raw copy (wrong size) would otherwise shadow the good compressed one.
+            let raw = self.repo.object_path(&hash);
+            if fs::metadata(&raw).is_ok_and(|m| m.len() != size) {
+                let _ = fs::remove_file(&raw);
+            }
+        }
         fsutil::sync_dir(parent);
         Ok((
             StoredObject {
                 hash,
                 size,
                 is_new: true,
+                stored_size,
             },
             true,
         ))
+    }
+
+    /// Stores a small object (already read into memory) in the current pack. The object is
+    /// durable only after the pack is committed: by `flush_pack`, when the pack fills up,
+    /// or by `commit_snapshot`.
+    pub fn store_small(&self, data: &[u8], compress: bool) -> Result<StoredObject> {
+        let size = data.len() as u64;
+        let hash = ObjectHash(*blake3::hash(data).as_bytes());
+        let existing = StoredObject {
+            hash,
+            size,
+            is_new: false,
+            stored_size: 0,
+        };
+        if self.repo.has_object(&hash, size) {
+            return Ok(existing);
+        }
+        let compressed = (compress
+            && self.repo.supports_compression()
+            && data.len() >= MIN_COMPRESS_SIZE
+            && worth_compressing(&data[..data.len().min(COMPRESS_SAMPLE)]))
+        .then(|| zstd::bulk::compress(data, ZSTD_LEVEL).ok())
+        .flatten()
+        .filter(|c| c.len() * 10 < data.len() * 9);
+        let (blob, encoding) = match &compressed {
+            Some(c) => (c.as_slice(), Encoding::Zstd),
+            None => (data, Encoding::Raw),
+        };
+
+        let mut guard = self.pack.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.as_ref().is_some_and(|p| p.hashes.contains(&hash))
+            || self.repo.pack_location(&hash).is_some()
+        {
+            return Ok(existing);
+        }
+        if guard.is_none() {
+            *guard = Some(OpenPack::create(&self.repo.staging_dir())?);
+        }
+        let p = guard.as_mut().expect("pack open");
+        p.append(hash, size, encoding, blob)?;
+        if p.offset >= pack::PACK_TARGET_SIZE {
+            let full = guard.take().expect("pack open");
+            self.commit_pack(full)?;
+        }
+        Ok(StoredObject {
+            hash,
+            size,
+            is_new: true,
+            stored_size: blob.len() as u64,
+        })
+    }
+
+    /// Commits the current pack, making every small object stored so far durable.
+    pub fn flush_pack(&self) -> Result<()> {
+        let open = self.pack.lock().unwrap_or_else(|p| p.into_inner()).take();
+        match open {
+            Some(p) if !p.entries.is_empty() => self.commit_pack(p),
+            Some(p) => {
+                let _ = fs::remove_file(&p.tmp);
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    fn commit_pack(&self, p: OpenPack) -> Result<()> {
+        let id = p.id.clone();
+        let entries = p.commit(&self.repo.staging_dir(), &self.repo.packs_dir())?;
+        self.repo.with_packs_mut(|idx| idx.add(&id, &entries));
+        Ok(())
     }
 
     /// The id the next snapshot will get: now, but always after the newest existing one.
@@ -448,6 +719,8 @@ impl RepoWriter {
     /// The caller must have stored every referenced object through this writer first.
     pub fn commit_snapshot(&self, snap: &Snapshot) -> Result<()> {
         snap.validate(&snap.id, self.repo.id())?;
+        // Small objects must be durable before the manifest that references them (I3).
+        self.flush_pack()?;
         for e in &snap.entries {
             if let Some(h) = &e.hash
                 && !self.repo.has_object(h, e.size)
@@ -504,7 +777,11 @@ impl RepoWriter {
                 cancel.check()?;
                 let obj = obj.ctx("list", &fan)?;
                 let name = obj.file_name();
-                let Some(hash) = name.to_str().and_then(|n| ObjectHash::from_hex(n).ok()) else {
+                let Some(hash) = name
+                    .to_str()
+                    .map(|n| n.strip_suffix(".zst").unwrap_or(n))
+                    .and_then(|n| ObjectHash::from_hex(n).ok())
+                else {
                     continue; // unknown file: never delete what we do not understand
                 };
                 if referenced.contains(&hash) {
@@ -517,7 +794,96 @@ impl RepoWriter {
                 }
             }
         }
+        self.gc_packs(&referenced, &mut report, cancel)?;
         Ok(report)
+    }
+}
+
+enum Sink {
+    Raw(File),
+    Zstd(zstd::stream::write::Encoder<'static, File>),
+}
+
+impl Sink {
+    fn write_all(&mut self, b: &[u8]) -> io::Result<()> {
+        match self {
+            Sink::Raw(f) => f.write_all(b),
+            Sink::Zstd(e) => e.write_all(b),
+        }
+    }
+
+    fn finish(self) -> io::Result<File> {
+        match self {
+            Sink::Raw(f) => Ok(f),
+            Sink::Zstd(e) => e.finish(),
+        }
+    }
+}
+
+/// Fills `buf` as far as possible; returns fewer bytes than `buf.len()` only at end of input.
+fn read_full(src: &mut dyn Read, buf: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match src.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
+}
+
+/// Quick test on a sample: store compressed only if it saves at least 10%.
+fn worth_compressing(sample: &[u8]) -> bool {
+    zstd::bulk::compress(sample, 1).is_ok_and(|c| c.len() * 10 < sample.len() * 9)
+}
+
+impl RepoWriter {
+    /// Deletes packs none of whose objects are referenced, and leftover packs without an index.
+    /// Packs with a damaged index are never touched.
+    fn gc_packs(
+        &self,
+        referenced: &HashSet<ObjectHash>,
+        report: &mut GcReport,
+        cancel: &CancelToken,
+    ) -> Result<()> {
+        self.flush_pack()?;
+        let dir = self.repo.packs_dir();
+        let idx = PackIndex::load(&dir);
+        let mut changed = false;
+        for (id, hashes) in &idx.packs {
+            cancel.check()?;
+            let used = hashes.iter().filter(|h| referenced.contains(h)).count() as u64;
+            if used > 0 {
+                report.objects_kept += used;
+                if used < hashes.len() as u64 {
+                    report.packs_partly_used += 1;
+                }
+                continue;
+            }
+            let pp = pack::pack_path(&dir, id);
+            let len = fs::metadata(&pp).map(|m| m.len()).unwrap_or(0);
+            // Index first: a pack without an index is ignored by readers and removed later.
+            let ip = pack::index_path(&dir, id);
+            fs::remove_file(&ip).ctx("delete", &ip)?;
+            fs::remove_file(&pp).ctx("delete", &pp)?;
+            report.objects_deleted += hashes.len() as u64;
+            report.bytes_freed += len;
+            changed = true;
+        }
+        for id in &idx.orphans {
+            let pp = pack::pack_path(&dir, id);
+            let len = fs::metadata(&pp).map(|m| m.len()).unwrap_or(0);
+            fs::remove_file(&pp).ctx("delete", &pp)?;
+            report.bytes_freed += len;
+            changed = true;
+        }
+        if changed {
+            fsutil::sync_dir(&dir);
+            self.repo.reload_packs();
+        }
+        Ok(())
     }
 }
 

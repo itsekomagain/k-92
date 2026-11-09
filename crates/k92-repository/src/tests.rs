@@ -16,6 +16,7 @@ fn tmp() -> tempfile::TempDir {
 fn store(w: &RepoWriter, data: &[u8]) -> StoredObject {
     w.store_object(
         &mut Cursor::new(data.to_vec()),
+        false,
         &CancelToken::new(),
         &mut |_| {},
     )
@@ -140,6 +141,7 @@ fn commit_refuses_snapshot_with_missing_objects() {
         hash: ObjectHash([7; 32]),
         size: 3,
         is_new: true,
+        stored_size: 3,
     };
     let s = snapshot_with(&w, &[("a.txt", &fake)]);
     assert!(w.commit_snapshot(&s).is_err());
@@ -164,7 +166,7 @@ fn cancelled_store_leaves_nothing_behind() {
     let w = r.writer().unwrap();
     let c = CancelToken::new();
     c.cancel();
-    let res = w.store_object(&mut Cursor::new(vec![1u8; 10]), &c, &mut |_| {});
+    let res = w.store_object(&mut Cursor::new(vec![1u8; 10]), false, &c, &mut |_| {});
     assert!(matches!(res, Err(StoreError::Repo(Error::Cancelled))));
     assert_eq!(fs::read_dir(r.root().join("staging")).unwrap().count(), 0);
 }
@@ -270,4 +272,277 @@ fn foreign_files_in_snapshots_dir_are_ignored() {
     fs::write(r.root().join("snapshots/notes.txt"), b"hi").unwrap();
     fs::write(r.root().join("snapshots/garbage.json"), b"{}").unwrap();
     assert!(r.snapshot_ids().unwrap().is_empty());
+}
+
+fn store_z(w: &RepoWriter, data: &[u8]) -> StoredObject {
+    w.store_object(
+        &mut Cursor::new(data.to_vec()),
+        true,
+        &CancelToken::new(),
+        &mut |_| {},
+    )
+    .unwrap_or_else(|e| panic!("{e:?}"))
+}
+
+fn read_back(r: &Repository, h: &ObjectHash) -> Vec<u8> {
+    let mut out = Vec::new();
+    r.read_object_into(h, &mut out, &CancelToken::new())
+        .unwrap();
+    out
+}
+
+#[test]
+fn compressible_data_is_stored_compressed_and_reads_back() {
+    let d = tmp();
+    let r = Repository::init(d.path()).unwrap();
+    assert!(r.supports_compression());
+    assert_eq!(r.descriptor().format_version, 2);
+    let w = r.writer().unwrap();
+    let text: Vec<u8> = b"The quick brown fox jumps over the lazy dog. "
+        .iter()
+        .cycle()
+        .take(3 * 1024 * 1024 + 17)
+        .copied()
+        .collect();
+    let o = store_z(&w, &text);
+    assert!(o.is_new);
+    assert!(o.stored_size < text.len() as u64 / 10, "{}", o.stored_size);
+    assert!(r.compressed_object_path(&o.hash).is_file());
+    assert!(!r.object_path(&o.hash).exists());
+    assert!(r.has_object(&o.hash, text.len() as u64));
+    assert_eq!(read_back(&r, &o.hash), text);
+    assert!(r.check_object(&o.hash).unwrap());
+
+    // Same content again deduplicates.
+    assert!(!store_z(&w, &text).is_new);
+}
+
+#[test]
+fn incompressible_or_tiny_data_is_stored_raw() {
+    let d = tmp();
+    let r = Repository::init(d.path()).unwrap();
+    let w = r.writer().unwrap();
+    // Pseudo-random bytes (like a JPEG or ZIP) do not compress.
+    let mut x = 0x1234_5678_u64;
+    let noise: Vec<u8> = (0..200_000)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect();
+    let o = store_z(&w, &noise);
+    assert!(r.object_path(&o.hash).is_file());
+    assert_eq!(o.stored_size, noise.len() as u64);
+    let tiny = store_z(&w, &[b'a'; 100]);
+    assert!(r.object_path(&tiny.hash).is_file());
+    assert_eq!(read_back(&r, &o.hash), noise);
+    assert_eq!(read_back(&r, &tiny.hash), vec![b'a'; 100]);
+}
+
+#[test]
+fn damaged_compressed_object_is_detected() {
+    let d = tmp();
+    let r = Repository::init(d.path()).unwrap();
+    let w = r.writer().unwrap();
+    let text = vec![b'z'; 100_000];
+    let o = store_z(&w, &text);
+    let p = r.compressed_object_path(&o.hash);
+    let mut bytes = fs::read(&p).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0xff;
+    fs::write(&p, &bytes).unwrap();
+    assert!(!r.check_object(&o.hash).unwrap());
+    let v = r.verify(true, &CancelToken::new()).unwrap();
+    assert_eq!(
+        v.corrupt_objects.len(),
+        0,
+        "unreferenced objects are not verified"
+    );
+
+    // GC understands .zst names: unreferenced compressed objects are removed.
+    let g = w.gc(&CancelToken::new()).unwrap();
+    assert_eq!(g.objects_deleted, 1);
+    assert!(!p.exists());
+}
+
+#[test]
+fn version_1_repositories_stay_raw_and_readable() {
+    let d = tmp();
+    let r = Repository::init(d.path()).unwrap();
+    // Rewrite the descriptor as a v1 repository.
+    let desc = r.root().join("k92-repository.json");
+    let mut v: serde_json::Value = serde_json::from_slice(&fs::read(&desc).unwrap()).unwrap();
+    v["formatVersion"] = 1.into();
+    v["objectEncoding"] = "raw".into();
+    fs::write(&desc, serde_json::to_vec(&v).unwrap()).unwrap();
+    let r = Repository::open(d.path()).unwrap();
+    assert!(!r.supports_compression());
+    let w = r.writer().unwrap();
+    let o = store_z(&w, &vec![b'q'; 50_000]);
+    assert!(r.object_path(&o.hash).is_file(), "v1 never writes .zst");
+
+    // A v1 descriptor claiming compression is rejected.
+    v["objectEncoding"] = "raw+zstd".into();
+    fs::write(&desc, serde_json::to_vec(&v).unwrap()).unwrap();
+    assert!(matches!(
+        Repository::open(d.path()),
+        Err(Error::Unsupported(_))
+    ));
+}
+
+#[test]
+fn small_objects_go_into_packs_and_survive_reopen() {
+    let d = tmp();
+    let r = Repository::init(d.path()).unwrap();
+    let w = r.writer().unwrap();
+    let mut stored = Vec::new();
+    for i in 0..300u32 {
+        let data = format!("small file number {i} ").repeat(1 + (i as usize % 400));
+        let o = w.store_small(data.as_bytes(), true).unwrap();
+        assert!(o.is_new);
+        stored.push((o, data));
+    }
+    // Duplicate content inside the open pack is not stored twice.
+    assert!(!w.store_small(stored[5].1.as_bytes(), true).unwrap().is_new);
+    w.flush_pack().unwrap();
+    drop(w);
+
+    let r2 = Repository::open(d.path()).unwrap();
+    let packs: Vec<_> = fs::read_dir(r2.root().join("packs")).unwrap().collect();
+    assert_eq!(packs.len(), 2, "one .pack and one .idx");
+    for (o, data) in &stored {
+        assert!(r2.has_object(&o.hash, o.size));
+        assert!(!r2.object_path(&o.hash).exists());
+        assert_eq!(read_back(&r2, &o.hash), data.as_bytes());
+    }
+    assert!(
+        stored.iter().any(|(o, _)| o.stored_size < o.size),
+        "some compressed"
+    );
+}
+
+#[test]
+fn unflushed_pack_is_invisible_after_a_crash() {
+    let d = tmp();
+    let r = Repository::init(d.path()).unwrap();
+    let w = r.writer().unwrap();
+    let o = w.store_small(b"not yet durable", false).unwrap();
+    // Simulate a crash: the writer goes away without flushing.
+    drop(w);
+    let r2 = Repository::open(d.path()).unwrap();
+    assert!(!r2.has_object(&o.hash, o.size));
+    // The next writer clears the half-written pack from staging.
+    let w2 = r2.writer().unwrap();
+    assert_eq!(fs::read_dir(r2.root().join("staging")).unwrap().count(), 0);
+    let o2 = w2.store_small(b"not yet durable", false).unwrap();
+    assert!(o2.is_new);
+}
+
+#[test]
+fn full_packs_commit_automatically() {
+    let d = tmp();
+    let r = Repository::init(d.path()).unwrap();
+    let w = r.writer().unwrap();
+    let mut x = 7u64;
+    let mut first = None;
+    // ~40 MB of incompressible 512 KB objects: crosses the 32 MB pack size.
+    for _ in 0..80 {
+        let data: Vec<u8> = (0..512 * 1024)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        let o = w.store_small(&data, true).unwrap();
+        first.get_or_insert(o);
+    }
+    let fresh = Repository::open(d.path()).unwrap();
+    let f = first.unwrap();
+    assert!(
+        fresh.has_object(&f.hash, f.size),
+        "first pack committed without flush"
+    );
+}
+
+#[test]
+fn damaged_pack_is_reported_and_never_cleaned_up() {
+    let d = tmp();
+    let r = Repository::init(d.path()).unwrap();
+    let w = r.writer().unwrap();
+    let a = w.store_small(b"aaaa", false).unwrap();
+    let s = snapshot_with(&w, &[("a.txt", &a)]);
+    w.commit_snapshot(&s).unwrap();
+    drop(w);
+    let idx = fs::read_dir(r.root().join("packs"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "idx"))
+        .unwrap();
+    fs::write(&idx, b"{\"checksum\":\"blake3:00\",\"body\":{}}").unwrap();
+
+    let r2 = Repository::open(d.path()).unwrap();
+    assert_eq!(r2.damaged_packs().len(), 1);
+    let v = r2.verify(false, &CancelToken::new()).unwrap();
+    assert_eq!(v.missing_objects, vec![a.hash.to_hex()]);
+    assert!(!v.is_healthy());
+    let w2 = r2.writer().unwrap();
+    w2.delete_snapshot(&s.id).unwrap();
+    w2.gc(&CancelToken::new()).unwrap();
+    assert!(idx.exists(), "damaged pack left alone");
+}
+
+#[test]
+fn gc_removes_unused_and_orphan_packs_and_keeps_used_ones() {
+    let d = tmp();
+    let r = Repository::init(d.path()).unwrap();
+    let w = r.writer().unwrap();
+    let keep = w.store_small(b"keep me", false).unwrap();
+    let s1 = snapshot_with(&w, &[("keep.txt", &keep)]);
+    w.commit_snapshot(&s1).unwrap();
+    let gone = w.store_small(b"delete me", false).unwrap();
+    let s2 = snapshot_with(&w, &[("gone.txt", &gone)]);
+    w.commit_snapshot(&s2).unwrap();
+    // An interrupted pack write: pack file without index.
+    fs::write(
+        r.root()
+            .join("packs")
+            .join("0123456789abcdef0123456789abcdef.pack"),
+        b"junk",
+    )
+    .unwrap();
+    w.delete_snapshot(&s2.id).unwrap();
+    let g = w.gc(&CancelToken::new()).unwrap();
+    assert_eq!(g.objects_deleted, 1);
+    assert!(g.bytes_freed >= 4 + "delete me".len() as u64);
+    assert!(r.has_object(&keep.hash, keep.size));
+    assert!(!r.has_object(&gone.hash, gone.size));
+    assert_eq!(
+        fs::read_dir(r.root().join("packs")).unwrap().count(),
+        2,
+        "only the used pack and its index remain"
+    );
+    assert!(r.verify(true, &CancelToken::new()).unwrap().is_healthy());
+}
+
+#[test]
+fn corrupt_bytes_inside_a_pack_are_detected() {
+    let d = tmp();
+    let r = Repository::init(d.path()).unwrap();
+    let w = r.writer().unwrap();
+    let a = w.store_small(b"will rot", false).unwrap();
+    let s = snapshot_with(&w, &[("a.txt", &a)]);
+    w.commit_snapshot(&s).unwrap();
+    let Some(ObjectFile::Packed { path, loc }) = r.locate_object(&a.hash, a.size) else {
+        panic!("packed")
+    };
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[loc.offset as usize + 6] = b'0';
+    fs::write(&path, bytes).unwrap();
+    assert!(!r.check_object(&a.hash).unwrap());
+    let v = r.verify(true, &CancelToken::new()).unwrap();
+    assert_eq!(v.corrupt_objects, vec![a.hash.to_hex()]);
 }

@@ -35,6 +35,9 @@ pub(crate) struct Record {
     pub hash: ObjectHash,
     /// The object was newly added to the repository by the interrupted run.
     pub new: bool,
+    /// Bytes the object takes on the backup drive (after compression).
+    #[serde(default)]
+    pub stored: u64,
 }
 
 pub(crate) type Index = HashMap<(String, RelPath), Record>;
@@ -169,6 +172,7 @@ mod tests {
             mtime: 1_700_000_000_000,
             hash: ObjectHash([7; 32]),
             new: true,
+            stored: 40,
         }
     }
 

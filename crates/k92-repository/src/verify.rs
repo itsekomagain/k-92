@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap};
 use k92_core::dto::VerifyReport;
 use k92_core::{CancelToken, ObjectHash, Result};
 
-use crate::Repository;
+use crate::{ObjectFile, Repository};
 
 /// Checks every manifest and every referenced object.
 /// Quick mode checks presence and size; deep mode re-hashes every object.
@@ -35,12 +35,15 @@ pub fn verify(repo: &Repository, deep: bool, cancel: &CancelToken) -> Result<Ver
     for (hash, (size, users)) in sorted {
         cancel.check()?;
         report.objects_checked += 1;
-        let path = repo.object_path(&hash);
-        let problem = match std::fs::metadata(&path) {
-            Err(_) => Some(&mut report.missing_objects),
-            Ok(m) if m.len() != size => Some(&mut report.corrupt_objects),
-            Ok(_) if deep && !repo.check_object(&hash)? => Some(&mut report.corrupt_objects),
-            Ok(_) => None,
+        let problem = match repo.locate_object(&hash, size) {
+            None => Some(&mut report.missing_objects),
+            Some(ObjectFile::Raw { len, .. }) if len != size => Some(&mut report.corrupt_objects),
+            Some(ObjectFile::Zstd { len: 0, .. }) => Some(&mut report.corrupt_objects),
+            Some(ObjectFile::Packed { loc, .. }) if loc.size != size => {
+                Some(&mut report.corrupt_objects)
+            }
+            Some(_) if deep && !repo.check_object(&hash)? => Some(&mut report.corrupt_objects),
+            Some(_) => None,
         };
         if let Some(list) = problem {
             list.push(hash.to_hex());

@@ -212,6 +212,7 @@ pub fn start_backup_job(app: &AppHandle, state: &Arc<AppState>) -> Result<()> {
                 sources: cfg.sources.iter().map(SourceSpec::new).collect(),
                 rehash_all: false,
                 exclude: ExcludeRules::new(&s.exclude, s.skip_common_junk, s.max_file_bytes)?,
+                compress: s.compress,
                 ..Default::default()
             };
             run_backup(&repo, &opts, cancel, progress)
@@ -240,7 +241,7 @@ pub fn start_backup_job(app: &AppHandle, state: &Arc<AppState>) -> Result<()> {
                 ActivityOutcome::Success
             },
             summary: format!(
-                "Backed up {} files ({} changed){}{}",
+                "Backed up {} files ({} changed){}{}{}",
                 r.files,
                 r.files_copied,
                 if skipped > 0 {
@@ -250,6 +251,15 @@ pub fn start_backup_job(app: &AppHandle, state: &Arc<AppState>) -> Result<()> {
                 },
                 if r.excluded > 0 {
                     format!(", {} excluded", r.excluded)
+                } else {
+                    String::new()
+                },
+                // Mention compression only when it saved something worth noticing.
+                if r.new_bytes.saturating_sub(r.new_stored_bytes) >= 1024 * 1024 {
+                    format!(
+                        ", {} saved by compression",
+                        k92_core::error::fmt_bytes(r.new_bytes - r.new_stored_bytes)
+                    )
                 } else {
                     String::new()
                 }

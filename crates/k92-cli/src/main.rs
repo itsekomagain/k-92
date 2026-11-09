@@ -57,6 +57,12 @@ enum Cmd {
         /// Leave out files larger than this many megabytes.
         #[arg(long, value_name = "MB")]
         max_file_size: Option<u64>,
+        /// Store everything uncompressed.
+        #[arg(long)]
+        no_compress: bool,
+        /// Files copied at the same time (default: based on CPU count).
+        #[arg(long)]
+        threads: Option<usize>,
     },
     /// List snapshots, oldest first.
     Snapshots {
@@ -193,6 +199,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
             exclude,
             include_junk,
             max_file_size,
+            no_compress,
+            threads,
         } => {
             let repo = Repository::open(&repo)?;
             let opts = BackupOptions {
@@ -203,6 +211,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     !include_junk,
                     max_file_size.map(|mb| mb.saturating_mul(1024 * 1024)),
                 )?,
+                compress: !no_compress,
+                threads,
                 ..Default::default()
             };
             let r = run_backup(&repo, &opts, &cancel, &no_progress)?;
@@ -215,7 +225,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 if r.excluded > 0 {
                     println!("  {} items excluded by rules", r.excluded);
                 }
-                println!("  {} new bytes stored in {} ms", r.new_bytes, r.duration_ms);
+                println!(
+                    "  {} new bytes stored as {} on the backup drive, in {} ms",
+                    r.new_bytes, r.new_stored_bytes, r.duration_ms
+                );
                 for s in &r.skipped {
                     println!(
                         "  skipped {:?}: {} {}",

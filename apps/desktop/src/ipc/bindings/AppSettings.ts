@@ -16,4 +16,8 @@ skipCommonJunk: boolean,
 /**
  * Leave out files larger than this many bytes. `None` = no limit.
  */
-maxFileBytes: number | null, };
+maxFileBytes: number | null, 
+/**
+ * Store compressible files compressed (new backup drives only).
+ */
+compress: boolean, };

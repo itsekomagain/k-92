@@ -28,3 +28,5 @@ date, build and OS in the release checklist. Never run these on a developer's ma
 | W20 | No sleep during backup | Set sleep to 1 minute; run a long backup without touching the PC | PC stays awake until the backup ends, then sleeps normally |
 | W21 | Progress for large jobs | Back up 100,000+ files | "Looking for changes… N files found", then a bar with "X of Y to copy" and a time-left estimate |
 | W22 | Exclusions | Settings → Leave out: exclude a subfolder, add `*.iso`, set "Larger than 1 GB"; back up | Those items are absent from the new backup (Timeline), activity says "N excluded", nothing reported as skipped; older backups still contain them |
+| W23 | Compression | Back up a folder of documents/spreadsheets (and some photos) | Activity shows "… saved by compression"; restored documents open normally and are identical (compare with `fc /b`) |
+| W24 | Many small files | Back up a folder with 50,000+ small files (e.g. a code project) to a USB drive; note the time; unplug mid-way on a second run | Completes far faster than one-file-at-a-time; after replug the next run resumes; `k92 verify --deep` OK |

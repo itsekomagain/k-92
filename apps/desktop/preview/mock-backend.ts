@@ -138,10 +138,11 @@ let configured = !location.hash.includes("setup");
 let sources = SOURCES.map((s) => s.path);
 let paused = false;
 let interval = 60;
-let extra: Pick<AppSettings, "exclude" | "skipCommonJunk" | "maxFileBytes"> = {
+let extra: Pick<AppSettings, "exclude" | "skipCommonJunk" | "maxFileBytes" | "compress"> = {
   exclude: ["C:\\Users\\Ada\\Documents\\Old ISOs", "*.iso"],
   skipCommonJunk: true,
   maxFileBytes: null,
+  compress: true,
 };
 let running: AppStatus["running"] = null;
 const activity: ActivityEntry[] = [
@@ -234,7 +235,7 @@ function handle(cmd: string, a: Record<string, any>): unknown {
       const s = a.settings as unknown as AppSettings;
       interval = s.intervalMinutes;
       paused = s.paused;
-      extra = { exclude: s.exclude, skipCommonJunk: s.skipCommonJunk, maxFileBytes: s.maxFileBytes };
+      extra = { exclude: s.exclude, skipCommonJunk: s.skipCommonJunk, maxFileBytes: s.maxFileBytes, compress: s.compress };
       return status();
     }
     case "update_sources":
