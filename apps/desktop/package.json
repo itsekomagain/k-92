@@ -25,5 +25,6 @@
     "typescript": "^7.0.2",
     "vite": "^8.3.6"
   },
-  "license": "GPL-3.0-or-later"
+  "license": "GPL-3.0-or-later",
+  "author": "Ekomobong Otu (https://ekom.blog)"
 }

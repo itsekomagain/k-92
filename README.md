@@ -2,6 +2,8 @@
 
 *Your PC. Your history. Your way back.*
 
+By Ekomobong Otu · [ekom.blog](https://ekom.blog)
+
 K-92 is a **Windows 10/11 (x64) desktop application** that backs up your folders to an external
 drive every hour, keeps a browsable history, and restores files or whole folders, with every
 restored file verified against its stored BLAKE3 hash.
@@ -66,6 +68,8 @@ See `docs/architecture/milestones.md`. Phase 1 engine, CLI and desktop UI are im
 the Windows Service, VSS, USN journal, SQLite catalog and signed installer are not yet.
 
 ## License
+
+Copyright © 2026 Ekomobong Otu · [ekom.blog](https://ekom.blog)
 
 K-92 is free software: you can redistribute it and/or modify it under the terms of the
 GNU General Public License as published by the Free Software Foundation, either version 3

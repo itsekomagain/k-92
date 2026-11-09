@@ -21,7 +21,11 @@ use k92_restore::{
 #[command(
     name = "k92",
     version,
-    about = "K-92 backup and recovery (portable CLI)"
+    about = "K-92 backup and recovery (portable CLI)",
+    long_version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        "\nCopyright © 2026 Ekomobong Otu · https://ekom.blog\nLicense GPL-3.0-or-later"
+    )
 )]
 struct Cli {
     /// Print machine-readable JSON instead of text.

@@ -253,6 +253,7 @@ export function SettingsScreen({ theme, setTheme }: { theme: Theme; setTheme: (t
         <div className="card stack">
           <h2>About</h2>
           <div className="small muted">K-92 0.1.0 · Your PC. Your history. Your way back.</div>
+          <div className="small muted">© 2026 Ekomobong Otu · <span className="selectable">ekom.blog</span> · Free software under the GNU GPL v3</div>
           <div className="small muted">K-92 never uploads your files and has no telemetry. Backups are readable without this app using the portable <span className="mono">k92</span> tool.</div>
         </div>
       </div>
