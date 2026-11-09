@@ -24,7 +24,7 @@ default-members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.90"
 license = "GPL-3.0-or-later"
 authors = ["Ekomobong Otu <https://ekom.blog>"]
 homepage = "https://ekom.blog"
