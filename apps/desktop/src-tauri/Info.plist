@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>K-92 backs up the folders you choose, which can include your Desktop.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>K-92 backs up the folders you choose, which can include Documents.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>K-92 backs up the folders you choose, which can include Downloads.</string>
+  <key>NSRemovableVolumesUsageDescription</key>
+  <string>K-92 saves backups to the external drive you choose.</string>
+  <key>NSNetworkVolumesUsageDescription</key>
+  <string>K-92 can save backups to a network drive you choose.</string>
+</dict>
+</plist>

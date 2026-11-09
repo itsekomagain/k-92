@@ -1,0 +1,39 @@
+# macOS build (second target). Windows remains the primary pipeline (windows.yml).
+name: macos
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Engine tests
+        run: cargo test --workspace --exclude k92-desktop
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build app and dmg (unsigned)
+        working-directory: apps/desktop
+        run: |
+          npm ci
+          npx tauri build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: k92-macos-dmg
+          path: target/release/bundle/dmg/*.dmg

@@ -1,7 +1,7 @@
 //! What a backup leaves out: chosen folders, name patterns (`*.iso`, `node_modules`), files over a
 //! size limit, and an optional built-in list of temporary/system junk.
 //!
-//! Matching is case-insensitive, as on Windows. Excluded items are not recorded as skipped (they
+//! Matching is case-insensitive, as on Windows and default macOS (APFS). Excluded items are not recorded as skipped (they
 //! were left out on purpose); the snapshot only counts them.
 
 use std::path::{Path, PathBuf};
@@ -19,6 +19,11 @@ pub const COMMON_JUNK: &[&str] = &[
     "~$*",
     "*.tmp",
     ".DS_Store",
+    ".Spotlight-V100",
+    ".fseventsd",
+    ".Trashes",
+    ".TemporaryItems",
+    ".DocumentRevisions-V100",
     "node_modules",
     "__pycache__",
 ];

@@ -262,7 +262,7 @@ export function SettingsScreen({ theme, setTheme }: { theme: Theme; setTheme: (t
             {(["system", "light", "dark"] as const).map((t) => (
               <label key={t} className="choice" style={{ padding: "8px 14px" }}>
                 <input type="radio" name="theme" checked={theme === t} onChange={() => setTheme(t)} />
-                {t === "system" ? "Match Windows" : t === "light" ? "Light" : "Dark"}
+                {t === "system" ? "Match system" : t === "light" ? "Light" : "Dark"}
               </label>
             ))}
           </div>
@@ -280,7 +280,7 @@ export function SettingsScreen({ theme, setTheme }: { theme: Theme; setTheme: (t
 }
 
 
-const COMMON_JUNK_LABEL = "Recycle Bin, Windows page/hibernation files, Thumbs.db, Office \u201c~$\u201d lock files, *.tmp, node_modules, __pycache__";
+const COMMON_JUNK_LABEL = "Recycle Bin, Windows page/hibernation files, Thumbs.db, Mac .DS_Store and Spotlight/Trash folders, Office \u201c~$\u201d lock files, *.tmp, node_modules, __pycache__";
 const GB = 1024 ** 3;
 const SIZE_LIMITS: [string, number | null][] = [
   ["No limit", null],

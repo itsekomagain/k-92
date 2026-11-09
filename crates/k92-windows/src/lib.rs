@@ -46,6 +46,16 @@ pub fn classify(meta: &Metadata) -> FileClass {
             return FileClass::Link;
         }
     }
+    #[cfg(target_os = "macos")]
+    {
+        // iCloud Drive "optimise storage": the file's data is not on this Mac
+        // (SF_DATALESS). Reading it would download it.
+        use std::os::macos::fs::MetadataExt;
+        const SF_DATALESS: u32 = 0x4000_0000;
+        if meta.st_flags() & SF_DATALESS != 0 {
+            return FileClass::CloudPlaceholder;
+        }
+    }
     if ft.is_dir() {
         FileClass::Directory
     } else if ft.is_file() {
@@ -109,10 +119,14 @@ pub fn available_space(path: &Path) -> io::Result<u64> {
     fs4::available_space(path)
 }
 
-/// Keeps the PC from going to sleep while held (the display may still turn off).
+/// Keeps the computer from going to sleep while held (the display may still turn off).
 /// Must be dropped on the thread that created it; it is deliberately `!Send`.
+/// Windows: `SetThreadExecutionState`. macOS: a `caffeinate -i` child process, which also
+/// exits by itself if K-92 quits (`-w <our pid>`).
 pub struct KeepAwake {
     _not_send: std::marker::PhantomData<*const ()>,
+    #[cfg(target_os = "macos")]
+    child: Option<std::process::Child>,
 }
 
 impl KeepAwake {
@@ -121,6 +135,14 @@ impl KeepAwake {
         set_execution_state(true);
         KeepAwake {
             _not_send: std::marker::PhantomData,
+            #[cfg(target_os = "macos")]
+            child: std::process::Command::new("/usr/bin/caffeinate")
+                .args(["-i", "-w", &std::process::id().to_string()])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .ok(),
         }
     }
 }
@@ -135,6 +157,11 @@ impl Drop for KeepAwake {
     fn drop(&mut self) {
         #[cfg(windows)]
         set_execution_state(false);
+        #[cfg(target_os = "macos")]
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
     }
 }
 
@@ -163,6 +190,23 @@ mod tests {
         let g = KeepAwake::new();
         drop(g);
         let _again = KeepAwake::default();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keep_awake_runs_caffeinate_and_stops_it() {
+        let mut g = KeepAwake::new();
+        let mut child = g.child.take().expect("caffeinate started");
+        assert!(child.try_wait().unwrap().is_none(), "caffeinate still running");
+        g.child = Some(child);
+        let pid = g.child.as_ref().unwrap().id();
+        drop(g);
+        let alive = std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "caffeinate stopped after drop");
     }
 
     use super::*;

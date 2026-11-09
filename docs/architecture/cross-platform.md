@@ -1,6 +1,10 @@
 # Cross-Platform Plan: Windows and macOS
 
-Status: proposal. Windows remains the first release; macOS follows once the Windows MVP is stable.
+Status: Windows is the first release. A first macOS build exists (2026-11-09): the same engine and app,
+built as `K-92.app` / `.dmg` (Apple silicon), with keep-awake via `caffeinate`, iCloud "optimised
+storage" placeholders skipped, Mac system folders in the junk list, and folder-access prompts.
+Still missing on Mac: signing/notarization, names containing `:` or `\\` (skipped), launchd
+background backups, Finder tags/xattrs, Intel/universal build.
 
 ## What moves between machines
 
