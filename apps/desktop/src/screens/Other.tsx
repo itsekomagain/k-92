@@ -5,6 +5,7 @@ import { Icon } from "../components/Icon";
 import { Banner, Empty, JobProgress } from "../components/ui";
 import { api, errorMessage } from "../ipc/api";
 import type { ActivityEntry } from "../ipc/bindings/ActivityEntry";
+import type { AppSettings } from "../ipc/bindings/AppSettings";
 import type { AppStatus } from "../ipc/bindings/AppStatus";
 import type { BrowseEntry } from "../ipc/bindings/BrowseEntry";
 import type { SnapshotSummary } from "../ipc/bindings/SnapshotSummary";
@@ -238,6 +239,8 @@ export function SettingsScreen({ theme, setTheme }: { theme: Theme; setTheme: (t
           <div className="small muted">Removing a folder stops future backups of it. Earlier backups keep their copies.</div>
         </div>
 
+        <ExclusionsCard settings={s} save={save} />
+
         <div className="card stack">
           <h2>Appearance</h2>
           <div className="row" role="radiogroup" aria-label="Theme">
@@ -261,3 +264,79 @@ export function SettingsScreen({ theme, setTheme }: { theme: Theme; setTheme: (t
   );
 }
 
+
+const COMMON_JUNK_LABEL = "Recycle Bin, Windows page/hibernation files, Thumbs.db, Office \u201c~$\u201d lock files, *.tmp, node_modules, __pycache__";
+const GB = 1024 ** 3;
+const SIZE_LIMITS: [string, number | null][] = [
+  ["No limit", null],
+  ["Larger than 1 GB", GB],
+  ["Larger than 4 GB", 4 * GB],
+  ["Larger than 10 GB", 10 * GB],
+  ["Larger than 50 GB", 50 * GB],
+];
+
+function ExclusionsCard({ settings: s, save }: { settings: AppSettings; save: (p: Promise<AppStatus>) => Promise<void> }) {
+  const [pattern, setPattern] = useState("");
+  const update = (patch: Partial<AppSettings>) => save(api.updateSettings({ ...s, ...patch }));
+
+  async function excludeFolder() {
+    const picked = await open({ directory: true, multiple: true, title: "Choose folders to leave out" });
+    const list = picked === null ? [] : Array.isArray(picked) ? picked : [picked];
+    if (list.length) await update({ exclude: [...s.exclude, ...list] });
+  }
+  async function addPattern() {
+    const p = pattern.trim();
+    if (!p) return;
+    await update({ exclude: [...s.exclude, p] });
+    setPattern("");
+  }
+  const isPath = (r: string) => /[\\/]/.test(r);
+  const limitValue = s.maxFileBytes === null ? "" : String(s.maxFileBytes);
+  const knownLimit = SIZE_LIMITS.some(([, v]) => (v === null ? "" : String(v)) === limitValue);
+
+  return (
+    <div className="card stack">
+      <div className="card-head" style={{ marginBottom: 0 }}>
+        <h2>Leave out</h2>
+        <button className="btn btn-sm" onClick={() => void excludeFolder()}><Icon name="plus" size={14} />Exclude a folder</button>
+      </div>
+      <label className="row" style={{ alignItems: "flex-start", cursor: "pointer" }}>
+        <input type="checkbox" style={{ marginTop: 3, accentColor: "var(--accent)" }} checked={s.skipCommonJunk}
+          onChange={(e) => void update({ skipCommonJunk: e.target.checked })} />
+        <span className="stack" style={{ gap: 2 }}>
+          <span>Skip temporary and system files (recommended)</span>
+          <span className="small faint">{COMMON_JUNK_LABEL}</span>
+        </span>
+      </label>
+      <div className="row" style={{ flexWrap: "wrap" }}>
+        <label htmlFor="maxsize" className="muted">Skip files</label>
+        <select id="maxsize" className="input" value={limitValue}
+          onChange={(e) => void update({ maxFileBytes: e.target.value === "" ? null : Number(e.target.value) })}>
+          {SIZE_LIMITS.map(([label, v]) => <option key={label} value={v === null ? "" : String(v)}>{label}</option>)}
+          {!knownLimit && <option value={limitValue}>Larger than {formatBytes(Number(s.maxFileBytes))}</option>}
+        </select>
+      </div>
+      {s.exclude.map((r) => (
+        <div className="folder-row" key={r}>
+          <Icon name={isPath(r) ? "folder" : "file"} className={isPath(r) ? "icon-folder" : "icon-file"} />
+          <span className="path" title={r}>
+            {isPath(r) ? <><strong>{baseName(r)}</strong> <span className="faint small">{r}</span></> : <><strong className="mono">{r}</strong> <span className="faint small">anywhere in your folders</span></>}
+          </span>
+          <button className="btn btn-ghost btn-sm" aria-label={`Stop leaving out ${r}`}
+            onClick={() => void update({ exclude: s.exclude.filter((x) => x !== r) })}>
+            <Icon name="x" size={16} />
+          </button>
+        </div>
+      ))}
+      <form className="row" onSubmit={(e) => { e.preventDefault(); void addPattern(); }}>
+        <input className="input" style={{ flex: 1 }} value={pattern} onChange={(e) => setPattern(e.target.value)}
+          placeholder="Name or pattern, e.g. *.iso or Downloads" aria-label="Name or pattern to leave out" />
+        <button className="btn btn-sm" type="submit" disabled={!pattern.trim()}>Add</button>
+      </form>
+      <div className="small muted">
+        Use <span className="mono">*</span> for any characters. Patterns match file and folder names anywhere in your backed-up folders.
+        Changes apply from the next backup; earlier backups keep what they already contain.
+      </div>
+    </div>
+  );
+}

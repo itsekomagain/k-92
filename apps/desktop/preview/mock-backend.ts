@@ -1,6 +1,7 @@
 // Browser-only stand-in for the Rust backend, used to publish a clickable UI preview.
 // It answers the same commands as src-tauri/src/commands.rs with SAMPLE data. Never shipped.
 
+import type { AppSettings } from "../src/ipc/bindings/AppSettings";
 import type { ActivityEntry } from "../src/ipc/bindings/ActivityEntry";
 import type { AppStatus } from "../src/ipc/bindings/AppStatus";
 import type { BrowseEntry } from "../src/ipc/bindings/BrowseEntry";
@@ -137,6 +138,11 @@ let configured = !location.hash.includes("setup");
 let sources = SOURCES.map((s) => s.path);
 let paused = false;
 let interval = 60;
+let extra: Pick<AppSettings, "exclude" | "skipCommonJunk" | "maxFileBytes"> = {
+  exclude: ["C:\\Users\\Ada\\Documents\\Old ISOs", "*.iso"],
+  skipCommonJunk: true,
+  maxFileBytes: null,
+};
 let running: AppStatus["running"] = null;
 const activity: ActivityEntry[] = [
   { at: iso(Date.now() - 2 * HOUR), kind: "backup", outcome: "success", summary: "Backed up 22 files (2 changed)", durationMs: 4100 },
@@ -165,7 +171,7 @@ function status(): AppStatus {
     lastError: null,
     running,
     nextBackupAt: paused || interval === 0 ? null : iso(new Date(last?.completedAt ?? Date.now()).getTime() + interval * 60_000),
-    settings: { intervalMinutes: interval, paused },
+    settings: { intervalMinutes: interval, paused, ...extra },
   };
 }
 
@@ -225,9 +231,10 @@ function handle(cmd: string, a: Record<string, any>): unknown {
       if (location.hash) history.replaceState(null, "", location.pathname);
       return status();
     case "update_settings": {
-      const s = a.settings as unknown as { intervalMinutes: number; paused: boolean };
+      const s = a.settings as unknown as AppSettings;
       interval = s.intervalMinutes;
       paused = s.paused;
+      extra = { exclude: s.exclude, skipCommonJunk: s.skipCommonJunk, maxFileBytes: s.maxFileBytes };
       return status();
     }
     case "update_sources":

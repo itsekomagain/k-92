@@ -79,7 +79,7 @@ The file is a JSON envelope whose checksum covers the **exact bytes** of the bod
         "modifiedMs": 1762680000000, "hash": "<64 hex>", "readonly": false }
     ],
     "skipped": [ { "source": 0, "path": "locked.pst", "reason": "locked" } ],
-    "stats": { "files": 1, "dirs": 1, "bytes": 1048576, "newObjects": 1, "newBytes": 1048576, "skipped": 1 }
+    "stats": { "files": 1, "dirs": 1, "bytes": 1048576, "newObjects": 1, "newBytes": 1048576, "skipped": 1, "excluded": 0 }
   }
 }
 ```
@@ -89,6 +89,7 @@ The file is a JSON envelope whose checksum covers the **exact bytes** of the bod
   no `/`, `\`, `:`, NUL, or other characters invalid in Windows file names.
 * A file is *deleted* in snapshot N if it appears in N-1 but not N; older snapshots still
   contain it, so deleted files remain restorable until those snapshots are pruned.
+* `stats.excluded` counts files and folders left out by exclusion rules (optional; 0 when absent).
 * `skipped` records what could not be backed up and why (locked, access denied,
   reparse point, invalid name, changed during read). Skipped items are not errors that
   abort the snapshot; they are surfaced to the user.

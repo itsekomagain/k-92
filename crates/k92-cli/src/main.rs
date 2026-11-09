@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 
-use k92_backup::{BackupOptions, SourceSpec, run_backup};
+use k92_backup::{BackupOptions, ExcludeRules, SourceSpec, run_backup};
 use k92_core::dto::{ConflictPolicy, EntryKind};
 use k92_core::{CancelToken, RelPath, no_progress};
 use k92_repository::Repository;
@@ -48,6 +48,15 @@ enum Cmd {
         /// Re-read every file instead of trusting size + modification time.
         #[arg(long)]
         deep: bool,
+        /// Leave out a folder (full path) or a name pattern such as "*.iso". Repeatable.
+        #[arg(long = "exclude", value_name = "PATH_OR_PATTERN")]
+        exclude: Vec<String>,
+        /// Also back up temporary and system files (Thumbs.db, *.tmp, node_modules, …).
+        #[arg(long)]
+        include_junk: bool,
+        /// Leave out files larger than this many megabytes.
+        #[arg(long, value_name = "MB")]
+        max_file_size: Option<u64>,
     },
     /// List snapshots, oldest first.
     Snapshots {
@@ -181,11 +190,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
             repo,
             sources,
             deep,
+            exclude,
+            include_junk,
+            max_file_size,
         } => {
             let repo = Repository::open(&repo)?;
             let opts = BackupOptions {
                 sources: sources.into_iter().map(SourceSpec::new).collect(),
                 rehash_all: deep,
+                exclude: ExcludeRules::new(
+                    &exclude,
+                    !include_junk,
+                    max_file_size.map(|mb| mb.saturating_mul(1024 * 1024)),
+                )?,
                 ..Default::default()
             };
             let r = run_backup(&repo, &opts, &cancel, &no_progress)?;
@@ -195,6 +212,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     "  {} files ({} copied, {} unchanged, {} removed since last), {} folders",
                     r.files, r.files_copied, r.files_unchanged, r.files_removed, r.dirs
                 );
+                if r.excluded > 0 {
+                    println!("  {} items excluded by rules", r.excluded);
+                }
                 println!("  {} new bytes stored in {} ms", r.new_bytes, r.duration_ms);
                 for s in &r.skipped {
                     println!(

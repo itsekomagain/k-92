@@ -4,4 +4,16 @@ export type AppSettings = {
 /**
  * Minutes between automatic backups. 0 disables the schedule.
  */
-intervalMinutes: number, paused: boolean, };
+intervalMinutes: number, paused: boolean, 
+/**
+ * Folders (full paths) and name patterns (`*.iso`, `node_modules`) to leave out.
+ */
+exclude: Array<string>, 
+/**
+ * Leave out temporary and system files (the built-in list).
+ */
+skipCommonJunk: boolean, 
+/**
+ * Leave out files larger than this many bytes. `None` = no limit.
+ */
+maxFileBytes: number | null, };

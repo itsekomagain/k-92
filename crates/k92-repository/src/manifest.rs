@@ -157,6 +157,9 @@ pub struct SnapshotStats {
     pub new_objects: u64,
     pub new_bytes: u64,
     pub skipped: u64,
+    /// Files and folders left out by exclusion rules (added in 0.1; absent in older manifests).
+    #[serde(default)]
+    pub excluded: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

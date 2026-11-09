@@ -11,6 +11,9 @@
 //!   files it already stored.
 
 mod checkpoint;
+pub mod exclude;
+
+pub use exclude::{COMMON_JUNK, ExcludeRules};
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -46,6 +49,8 @@ pub struct BackupOptions {
     pub sources: Vec<SourceSpec>,
     /// Ignore size+mtime shortcuts and re-read every file ("deep backup").
     pub rehash_all: bool,
+    /// Folders, name patterns and size limits to leave out.
+    pub exclude: ExcludeRules,
     /// Free-space query for the destination. `None` asks the OS; tests substitute their own.
     pub available_space: Option<fn(&Path) -> io::Result<u64>>,
 }
@@ -96,6 +101,7 @@ pub fn run_backup(
         bytes_total: None,
         bytes_needed: 0,
         rehash_all: opts.rehash_all,
+        exclude: &opts.exclude,
         entries: Vec::new(),
         skipped: Vec::new(),
         stats: SnapshotStats::default(),
@@ -184,6 +190,7 @@ pub fn run_backup(
         files_copied: job.files_copied,
         files_unchanged: job.files_unchanged,
         files_removed,
+        excluded: snapshot.stats.excluded,
         new_objects: snapshot.stats.new_objects,
         new_bytes: snapshot.stats.new_bytes,
         skipped: snapshot
@@ -343,6 +350,7 @@ struct Job<'a> {
     bytes_total: Option<u64>,
     bytes_needed: u64,
     rehash_all: bool,
+    exclude: &'a ExcludeRules,
     entries: Vec<Entry>,
     skipped: Vec<SkippedItem>,
     stats: SnapshotStats,
@@ -431,7 +439,17 @@ impl Job<'_> {
                         continue;
                     }
                 };
-                match k92_windows::classify(&meta) {
+                let class = k92_windows::classify(&meta);
+                let left_out = match class {
+                    FileClass::Directory => self.exclude.excludes_dir(&path, name_str),
+                    FileClass::Regular => self.exclude.excludes_file(&path, name_str, meta.len()),
+                    _ => self.exclude.excludes_dir(&path, name_str),
+                };
+                if left_out {
+                    self.stats.excluded += 1;
+                    continue;
+                }
+                match class {
                     FileClass::Directory => {
                         self.push_dir(sid, child_rel.clone(), &meta);
                         subdirs.push((path, child_rel));
@@ -477,7 +495,17 @@ impl Job<'_> {
                     continue;
                 };
                 match k92_windows::classify(&meta) {
-                    FileClass::Directory => stack.push((path, child_rel)),
+                    FileClass::Directory => {
+                        if !self.exclude.excludes_dir(&path, &name.to_string_lossy()) {
+                            stack.push((path, child_rel));
+                        }
+                    }
+                    FileClass::Regular
+                        if self.exclude.excludes_file(
+                            &path,
+                            &name.to_string_lossy(),
+                            meta.len(),
+                        ) => {}
                     FileClass::Regular => {
                         let size = meta.len();
                         let mtime = mtime_ms(&meta);

@@ -57,6 +57,7 @@ The desktop crate cannot be fully built off Windows (its build embeds Windows re
 ## Portable recovery
 
 ```powershell
+k92 backup --repo E:\ C:\Users\Ada\Documents --exclude "*.iso" --exclude "C:\Users\Ada\Documents\Old" --max-file-size 10240
 k92 snapshots --repo E:\
 k92 restore --repo E:\ --snapshot latest --path "Reports/q3.xlsx" --to C:\Recovered
 k92 verify --repo E:\ --deep

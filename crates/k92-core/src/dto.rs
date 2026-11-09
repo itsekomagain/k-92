@@ -97,6 +97,9 @@ pub struct BackupReport {
     /// Files present in the parent snapshot but gone now. They remain in older snapshots.
     #[ts(type = "number")]
     pub files_removed: u64,
+    /// Files and folders left out by exclusion rules.
+    #[ts(type = "number")]
+    pub excluded: u64,
     #[ts(type = "number")]
     pub new_objects: u64,
     #[ts(type = "number")]
@@ -292,6 +295,20 @@ pub struct AppSettings {
     /// Minutes between automatic backups. 0 disables the schedule.
     pub interval_minutes: u32,
     pub paused: bool,
+    /// Folders (full paths) and name patterns (`*.iso`, `node_modules`) to leave out.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// Leave out temporary and system files (the built-in list).
+    #[serde(default = "yes")]
+    pub skip_common_junk: bool,
+    /// Leave out files larger than this many bytes. `None` = no limit.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub max_file_bytes: Option<u64>,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Default for AppSettings {
@@ -299,6 +316,9 @@ impl Default for AppSettings {
         AppSettings {
             interval_minutes: 60,
             paused: false,
+            exclude: Vec::new(),
+            skip_common_junk: true,
+            max_file_bytes: None,
         }
     }
 }

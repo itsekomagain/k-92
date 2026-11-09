@@ -13,4 +13,8 @@ filesUnchanged: number,
 /**
  * Files present in the parent snapshot but gone now. They remain in older snapshots.
  */
-filesRemoved: number, newObjects: number, newBytes: number, skipped: Array<SkippedItemDto>, durationMs: number, };
+filesRemoved: number, 
+/**
+ * Files and folders left out by exclusion rules.
+ */
+excluded: number, newObjects: number, newBytes: number, skipped: Array<SkippedItemDto>, durationMs: number, };

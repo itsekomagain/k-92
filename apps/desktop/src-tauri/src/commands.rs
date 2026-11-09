@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use tauri::{AppHandle, State};
 
-use k92_backup::{BackupOptions, SourceSpec, run_backup};
+use k92_backup::{BackupOptions, ExcludeRules, SourceSpec, run_backup};
 use k92_core::dto::*;
 use k92_core::{Error, ErrorDto, RelPath, Result};
 use k92_repository::{Repository, SnapshotId};
@@ -162,6 +162,20 @@ pub fn update_settings(state: St<'_>, settings: AppSettings) -> Cmd<AppStatus> {
         if settings.interval_minutes > 7 * 24 * 60 {
             return Err(Error::InvalidRequest("interval too long".into()));
         }
+        if settings.exclude.len() > 500 {
+            return Err(Error::InvalidRequest("too many exclusions".into()));
+        }
+        let mut settings = settings;
+        // Validate and normalise every rule (rejects relative paths, empty or match-all rules).
+        let mut clean: Vec<String> = Vec::new();
+        for raw in &settings.exclude {
+            k92_backup::exclude::Rule::parse(raw)?;
+            let t = raw.trim().to_string();
+            if !clean.iter().any(|c| c.eq_ignore_ascii_case(&t)) {
+                clean.push(t);
+            }
+        }
+        settings.exclude = clean;
         state.update_config(|c| c.settings = settings)?;
         Ok(())
     })())?;
@@ -193,9 +207,11 @@ pub fn start_backup_job(app: &AppHandle, state: &Arc<AppState>) -> Result<()> {
     spawn_job(app, state, JobKind::Backup, move |cancel, progress| {
         let attempt = crate::state::now();
         let result = st.open_repo().and_then(|repo| {
+            let s = &cfg.settings;
             let opts = BackupOptions {
                 sources: cfg.sources.iter().map(SourceSpec::new).collect(),
                 rehash_all: false,
+                exclude: ExcludeRules::new(&s.exclude, s.skip_common_junk, s.max_file_bytes)?,
                 ..Default::default()
             };
             run_backup(&repo, &opts, cancel, progress)
@@ -224,11 +240,16 @@ pub fn start_backup_job(app: &AppHandle, state: &Arc<AppState>) -> Result<()> {
                 ActivityOutcome::Success
             },
             summary: format!(
-                "Backed up {} files ({} changed){}",
+                "Backed up {} files ({} changed){}{}",
                 r.files,
                 r.files_copied,
                 if skipped > 0 {
                     format!(", {skipped} skipped")
+                } else {
+                    String::new()
+                },
+                if r.excluded > 0 {
+                    format!(", {} excluded", r.excluded)
                 } else {
                     String::new()
                 }

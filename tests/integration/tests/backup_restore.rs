@@ -806,3 +806,66 @@ fn locked_file_is_skipped_and_reported() {
     assert_eq!(r.files, 1);
     assert_eq!(r.skipped[0].reason, SkipReason::Locked);
 }
+
+#[test]
+fn exclusions_leave_out_folders_patterns_junk_and_big_files() {
+    let e = env();
+    e.write("keep/report.docx", "report");
+    e.write("keep/~$report.docx", "office lock file");
+    e.write("Old ISOs/ubuntu.iso", vec![1u8; 4000]);
+    e.write("Videos/Holiday.ISO", vec![2u8; 3000]);
+    e.write("Videos/clip.mp4", vec![3u8; 2000]);
+    e.write("code/node_modules/lib/index.js", "x");
+    e.write("code/app.js", "y");
+    e.write("Thumbs.db", "t");
+
+    let rules = k92_backup::ExcludeRules::new(
+        &["*.iso".into(), e.src.join("Old ISOs").display().to_string()],
+        true,
+        Some(1500),
+    )
+    .unwrap();
+    let opts = BackupOptions {
+        exclude: rules,
+        ..e.opts()
+    };
+    let max_total = AtomicU64::new(0);
+    let r = run_backup(
+        &e.repo,
+        &opts,
+        &CancelToken::new(),
+        &|ev: k92_core::dto::ProgressEvent| {
+            if let Some(t) = ev.bytes_total {
+                max_total.fetch_max(t, Ordering::SeqCst);
+            }
+        },
+    )
+    .unwrap();
+    assert!(
+        r.skipped.is_empty(),
+        "exclusions are not reported as skipped"
+    );
+    let snap = e.snap("latest");
+    let mut files: Vec<String> = snap
+        .entries
+        .iter()
+        .filter(|x| x.kind == k92_core::dto::EntryKind::File)
+        .map(|x| x.path.to_string())
+        .collect();
+    files.sort();
+    assert_eq!(files, ["code/app.js", "keep/report.docx"]);
+    // Old ISOs (folder), Holiday.ISO, clip.mp4 (over 1500 bytes), ~$report.docx,
+    // node_modules (folder), Thumbs.db.
+    assert_eq!(r.excluded, 6);
+    assert_eq!(snap.stats.excluded, 6);
+    assert_eq!(
+        max_total.load(Ordering::SeqCst),
+        "report".len() as u64 + 1,
+        "excluded files are not counted in the amount to copy"
+    );
+
+    // Without rules everything is backed up; older manifests without `excluded` still load.
+    let all = e.backup();
+    assert_eq!(all.files, 8);
+    assert_eq!(all.excluded, 0);
+}
