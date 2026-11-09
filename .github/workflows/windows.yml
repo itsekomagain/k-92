@@ -12,13 +12,13 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -46,7 +46,16 @@ jobs:
 
       - name: Build installers (MSI + NSIS)
         working-directory: apps/desktop
-        run: npx tauri build
+        run: |
+          npx tauri build *> build.log
+          $code = $LASTEXITCODE
+          Get-Content build.log
+          if ($code -ne 0) {
+            # Surface the tail as an annotation so failures are readable without opening the log.
+            $tail = (Get-Content build.log -Tail 40) -join '%0A'
+            Write-Output "::error title=tauri build failed::$tail"
+            exit $code
+          }
 
       - uses: actions/upload-artifact@v4
         with:
