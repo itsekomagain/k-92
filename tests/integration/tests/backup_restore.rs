@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use k92_backup::{BackupOptions, SourceSpec, run_backup};
-use k92_core::dto::{BackupReport, ConflictKind, ConflictPolicy, SkipReason};
+use k92_core::dto::{BackupReport, ConflictKind, ConflictPolicy, JobPhase, SkipReason};
 use k92_core::{CancelToken, Error, RelPath, no_progress};
 use k92_repository::retention::{RetentionPolicy, plan};
 use k92_repository::{Repository, Snapshot};
@@ -50,6 +50,7 @@ impl Env {
         BackupOptions {
             sources: vec![SourceSpec::new(&self.src)],
             rehash_all: false,
+            ..Default::default()
         }
     }
 
@@ -441,15 +442,15 @@ fn fresh_install_imports_existing_repository() {
 }
 
 #[test]
-fn cancellation_commits_nothing_and_next_run_resumes() {
+fn cancellation_commits_nothing_and_next_run_resumes_without_rereading() {
     let e = env();
     for i in 0..10 {
         e.write(&format!("f{i}.bin"), vec![i as u8; 1000]);
     }
     let cancel = CancelToken::new();
-    let seen = AtomicU64::new(0);
-    let progress = |_ev: k92_core::dto::ProgressEvent| {
-        if seen.fetch_add(1, Ordering::SeqCst) == 5 {
+    let copied = AtomicU64::new(0);
+    let progress = |ev: k92_core::dto::ProgressEvent| {
+        if ev.phase == JobPhase::Copying && copied.fetch_add(1, Ordering::SeqCst) == 4 {
             cancel.cancel();
         }
     };
@@ -459,20 +460,187 @@ fn cancellation_commits_nothing_and_next_run_resumes() {
         e.repo.snapshot_ids().unwrap().is_empty(),
         "nothing committed"
     );
+    assert!(e.repo.checkpoint_path().exists(), "progress was journaled");
 
-    let r = e.backup();
+    // One already-stored file changes before the retry: it must be read again.
+    e.write("f0.bin", vec![42u8; 1000]);
+    touch_later(&e.src.join("f0.bin"));
+
+    let read = AtomicU64::new(0);
+    let r = run_backup(
+        &e.repo,
+        &e.opts(),
+        &CancelToken::new(),
+        &|ev: k92_core::dto::ProgressEvent| {
+            read.fetch_max(ev.bytes_done, Ordering::SeqCst);
+        },
+    )
+    .unwrap();
     assert_eq!(r.files, 10);
-    assert!(
-        r.new_objects < 10,
-        "objects stored before cancel were reused: {}",
-        r.new_objects
+    assert_eq!(
+        r.files_copied, 10,
+        "all files are new relative to no parent"
     );
+    assert_eq!(
+        read.load(Ordering::SeqCst),
+        6 * 1000,
+        "only f0 (changed) and the 5 files never reached were read"
+    );
+    assert_eq!(
+        r.new_objects, 10,
+        "f1-f4 from the interrupted run, the new f0, and f5-f9"
+    );
+    assert!(
+        !e.repo.checkpoint_path().exists(),
+        "journal removed after commit"
+    );
+    let out = e.restore_to_out(&e.snap("latest"), "f0.bin", ConflictPolicy::Fail);
+    assert_eq!(out.restored, 1);
+    assert_eq!(fs::read(e.out.join("f0.bin")).unwrap(), vec![42u8; 1000]);
     assert!(
         e.repo
             .verify(true, &CancelToken::new())
             .unwrap()
             .is_healthy()
     );
+}
+
+const MIB: u64 = 1024 * 1024;
+/// The engine keeps this much free beyond the data (`SPACE_RESERVE`) plus 512 bytes per file.
+fn reserve(files: u64) -> u64 {
+    64 * MIB + files * 512
+}
+
+#[test]
+fn not_enough_space_is_reported_before_copying() {
+    static FREE: AtomicU64 = AtomicU64::new(0);
+    fn free(_: &Path) -> std::io::Result<u64> {
+        Ok(FREE.load(Ordering::SeqCst))
+    }
+    let e = env();
+    for i in 0..3 {
+        e.write(&format!("f{i}.bin"), vec![i as u8; MIB as usize]);
+    }
+    FREE.store(reserve(3) + 2 * MIB, Ordering::SeqCst);
+    let opts = BackupOptions {
+        available_space: Some(free),
+        ..e.opts()
+    };
+    let res = run_backup(&e.repo, &opts, &CancelToken::new(), &no_progress);
+    match res {
+        Err(Error::InsufficientSpace { needed, available }) => {
+            assert_eq!(needed, 3 * MIB + reserve(3));
+            assert_eq!(available, reserve(3) + 2 * MIB);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(e.repo.snapshot_ids().unwrap().is_empty());
+    assert_eq!(
+        e.repo
+            .verify(false, &CancelToken::new())
+            .unwrap()
+            .objects_checked,
+        0
+    );
+    assert!(
+        fs::read_dir(e.repo.root().join("objects")).unwrap().count() == 0,
+        "nothing written"
+    );
+
+    FREE.store(reserve(3) + 3 * MIB, Ordering::SeqCst);
+    let r = run_backup(&e.repo, &opts, &CancelToken::new(), &no_progress).unwrap();
+    assert_eq!(r.files_copied, 3);
+}
+
+#[test]
+fn drive_filling_up_mid_backup_stops_and_resume_keeps_progress() {
+    static FREE: AtomicU64 = AtomicU64::new(0);
+    fn free(_: &Path) -> std::io::Result<u64> {
+        Ok(FREE.load(Ordering::SeqCst))
+    }
+    let e = env();
+    for i in 0..3 {
+        e.write(&format!("f{i}.bin"), vec![i as u8; MIB as usize]);
+    }
+    // Enough for the files as scanned, but f2 grows to 10 MB while f0 is being backed up.
+    FREE.store(reserve(3) + 3 * MIB, Ordering::SeqCst);
+    let opts = BackupOptions {
+        available_space: Some(free),
+        ..e.opts()
+    };
+    let grown = std::sync::atomic::AtomicBool::new(false);
+    let res = run_backup(
+        &e.repo,
+        &opts,
+        &CancelToken::new(),
+        &|ev: k92_core::dto::ProgressEvent| {
+            if ev.phase == JobPhase::Copying && !grown.swap(true, Ordering::SeqCst) {
+                e.write("f2.bin", vec![2u8; 10 * MIB as usize]);
+            }
+        },
+    );
+    assert!(
+        matches!(res, Err(Error::InsufficientSpace { .. })),
+        "{res:?}"
+    );
+    assert!(e.repo.snapshot_ids().unwrap().is_empty());
+
+    // After freeing space, the retry reads only f2.
+    FREE.store(u64::MAX / 2, Ordering::SeqCst);
+    let read = AtomicU64::new(0);
+    let r = run_backup(
+        &e.repo,
+        &opts,
+        &CancelToken::new(),
+        &|ev: k92_core::dto::ProgressEvent| {
+            read.fetch_max(ev.bytes_done, Ordering::SeqCst);
+            if ev.phase == JobPhase::Copying {
+                assert_eq!(ev.files_total, Some(3));
+                assert_eq!(ev.bytes_total, Some(10 * MIB));
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!(r.files, 3);
+    assert_eq!(read.load(Ordering::SeqCst), 10 * MIB);
+    assert_eq!(r.bytes, 12 * MIB);
+}
+
+#[test]
+fn renamed_folder_does_not_count_as_new_space() {
+    static FREE: AtomicU64 = AtomicU64::new(u64::MAX / 2);
+    fn free(_: &Path) -> std::io::Result<u64> {
+        Ok(FREE.load(Ordering::SeqCst))
+    }
+    let e = env();
+    for i in 0..3 {
+        e.write(&format!("Photos/f{i}.bin"), vec![i as u8; MIB as usize]);
+    }
+    let opts = BackupOptions {
+        available_space: Some(free),
+        ..e.opts()
+    };
+    run_backup(&e.repo, &opts, &CancelToken::new(), &no_progress).unwrap();
+    fs::rename(e.src.join("Photos"), e.src.join("Pictures")).unwrap();
+    // Room for one file at a time (it is staged before deduplication), not for all three.
+    FREE.store(reserve(3) + MIB + MIB / 2, Ordering::SeqCst);
+    let r = run_backup(&e.repo, &opts, &CancelToken::new(), &no_progress).unwrap();
+    assert_eq!(r.new_objects, 0);
+    assert_eq!(r.files, 3);
+}
+
+#[test]
+fn damaged_checkpoint_is_ignored() {
+    let e = env();
+    e.write("a.txt", "hello");
+    fs::write(
+        e.repo.checkpoint_path(),
+        b"garbage\n0000000000000000 {\"s\":1}\n\xff\xfe",
+    )
+    .unwrap();
+    let r = e.backup();
+    assert_eq!(r.files_copied, 1);
+    assert!(!e.repo.checkpoint_path().exists());
 }
 
 #[test]

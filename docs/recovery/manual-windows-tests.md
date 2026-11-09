@@ -23,3 +23,7 @@ date, build and OS in the release checklist. Never run these on a developer's ma
 | W15 | Portable CLI | On a different PC, run `k92 restore` against the drive | Files restored and verified |
 | W16 | Uninstall | Uninstall app | Backups on drive remain untouched |
 | W17 | Dark mode / keyboard | Switch Windows to dark; navigate with Tab/arrows/Ctrl+1-6 | All screens readable and operable |
+| W18 | Large backup, interrupted | Back up 50 GB+; during copying, cancel (or unplug the drive); back up again | Second run's progress starts near where the first stopped ("to copy" shows only the rest); final snapshot complete; `k92 verify --deep` OK |
+| W19 | Destination too small | Choose a source larger than the free space on the backup drive | Backup refuses to start with "not enough space … needs about X, only Y is free"; nothing written |
+| W20 | No sleep during backup | Set sleep to 1 minute; run a long backup without touching the PC | PC stays awake until the backup ends, then sleeps normally |
+| W21 | Progress for large jobs | Back up 100,000+ files | "Looking for changes… N files found", then a bar with "X of Y to copy" and a time-left estimate |

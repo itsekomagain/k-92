@@ -4,4 +4,8 @@ import type { JobPhase } from "./JobPhase";
 /**
  * Progress notification. Totals are unknown (`None`) while scanning.
  */
-export type ProgressEvent = { phase: JobPhase, filesDone: number, filesTotal: number | null, bytesDone: number, currentPath: string | null, };
+export type ProgressEvent = { phase: JobPhase, filesDone: number, filesTotal: number | null, bytesDone: number, 
+/**
+ * Bytes this job expects to read (backup: new and changed files). `None` while unknown.
+ */
+bytesTotal: number | null, currentPath: string | null, };

@@ -104,8 +104,67 @@ pub fn set_readonly(path: &Path, readonly: bool) -> io::Result<()> {
     Ok(())
 }
 
+/// Bytes the current user can still write on the volume that holds `path`.
+pub fn available_space(path: &Path) -> io::Result<u64> {
+    fs4::available_space(path)
+}
+
+/// Keeps the PC from going to sleep while held (the display may still turn off).
+/// Must be dropped on the thread that created it; it is deliberately `!Send`.
+pub struct KeepAwake {
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl KeepAwake {
+    pub fn new() -> Self {
+        #[cfg(windows)]
+        set_execution_state(true);
+        KeepAwake {
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Default for KeepAwake {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for KeepAwake {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        set_execution_state(false);
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn set_execution_state(awake: bool) {
+    use windows_sys::Win32::System::Power::{
+        ES_CONTINUOUS, ES_SYSTEM_REQUIRED, SetThreadExecutionState,
+    };
+    let flags = if awake {
+        ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+    } else {
+        ES_CONTINUOUS
+    };
+    // SAFETY: plain Win32 call with no pointers; it only changes this thread's power request.
+    // Failure (return 0) is harmless: the PC may then sleep as usual.
+    let _ = unsafe { SetThreadExecutionState(flags) };
+}
+
 #[cfg(test)]
 mod tests {
+    use super::KeepAwake;
+
+    #[test]
+    fn keep_awake_guard_sets_and_clears() {
+        let g = KeepAwake::new();
+        drop(g);
+        let _again = KeepAwake::default();
+    }
+
     use super::*;
 
     #[test]

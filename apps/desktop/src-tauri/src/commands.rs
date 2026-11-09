@@ -196,6 +196,7 @@ pub fn start_backup_job(app: &AppHandle, state: &Arc<AppState>) -> Result<()> {
             let opts = BackupOptions {
                 sources: cfg.sources.iter().map(SourceSpec::new).collect(),
                 rehash_all: false,
+                ..Default::default()
             };
             run_backup(&repo, &opts, cancel, progress)
         });

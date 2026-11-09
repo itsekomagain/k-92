@@ -431,6 +431,7 @@ pub fn restore(
                     phase: JobPhase::Restoring,
                     files_done,
                     files_total: Some(files_total),
+                    bytes_total: None,
                     bytes_done: report.bytes,
                     current_path: Some(shown.clone()),
                 });

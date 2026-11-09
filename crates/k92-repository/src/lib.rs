@@ -144,6 +144,12 @@ impl Repository {
         self.root.join("snapshots")
     }
 
+    /// Progress journal of an unfinished backup (advisory; see `k92-backup::checkpoint`).
+    /// Lives outside `staging/`, which is cleared whenever a writer opens the repository.
+    pub fn checkpoint_path(&self) -> PathBuf {
+        self.root.join("checkpoint.jsonl")
+    }
+
     fn staging_dir(&self) -> PathBuf {
         self.root.join("staging")
     }

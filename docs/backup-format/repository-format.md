@@ -16,6 +16,7 @@ needed. A fresh K-92 install (or the portable `k92` CLI) can open any repository
   objects/<aa>/<64 hex>        content blobs, named by BLAKE3 of their bytes
   snapshots/<snapshot-id>.json committed snapshot manifests
   staging/                     scratch area for in-progress writes (never referenced)
+  checkpoint.jsonl             progress journal of an unfinished backup (optional, advisory)
   lock                         advisory lock file for the single writer
 ```
 
@@ -105,13 +106,25 @@ The file is a JSON envelope whose checksum covers the **exact bytes** of the bod
 | I7 | All manifest contents are untrusted: ids, paths and hashes are validated before use, and restore never writes outside the chosen destination. |
 | I8 | Garbage collection deletes an object only if no committed manifest references it. If **any** manifest cannot be read, GC deletes nothing. |
 | I9 | Retention deletes snapshot manifests only; space is reclaimed by a later GC pass. A failed operation never deletes a valid snapshot. |
+| I10 | `checkpoint.jsonl` is never part of a snapshot and nothing depends on it. A record is appended only after its object is durable, and is used only if that object still exists with the recorded size and the source file's size and modified time still match. Damaged or foreign lines are ignored; deleting the file only costs re-reading. |
+
+### Checkpoint journal (`checkpoint.jsonl`)
+
+One line per file stored by a backup that has not committed yet:
+`<first 16 hex chars of BLAKE3(json)> <json>`, where json is
+`{"s": source key, "p": relative path, "size", "mtime": ms, "hash", "new": bool}`.
+The next backup run uses matching records like entries of the parent snapshot, so files that were
+already stored are not read again. The file is synced every 256 MiB or 20 s and on exit, and is
+deleted when a snapshot commits. GC ignores it, so objects listed only there may be collected;
+the backup then simply reads those files again.
 
 ## 6. Crash and interruption behaviour
 
 | Interrupted during | Result after restart |
 |--------------------|----------------------|
 | object write | stray file in `staging/` (cleaned on next write session); no visible change |
-| after some objects, before manifest | unreferenced but valid objects; the next backup reuses them (safe resume) and GC can reclaim them otherwise |
+| after some objects, before manifest | unreferenced but valid objects plus `checkpoint.jsonl`; the next backup skips files already stored (I10) and GC can reclaim the objects otherwise |
+| destination full | backup stops with "not enough space" before or during copying; nothing committed; progress kept in the checkpoint |
 | manifest write | stray staging file; snapshot not visible (I2) |
 | manifest rename | atomic on NTFS/ReFS/APFS/ext4: either visible and complete or absent |
 

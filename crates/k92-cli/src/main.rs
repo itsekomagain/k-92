@@ -186,6 +186,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let opts = BackupOptions {
                 sources: sources.into_iter().map(SourceSpec::new).collect(),
                 rehash_all: deep,
+                ..Default::default()
             };
             let r = run_backup(&repo, &opts, &cancel, &no_progress)?;
             print(json, &r, || {

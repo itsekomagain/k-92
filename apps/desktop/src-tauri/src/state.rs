@@ -221,6 +221,9 @@ where
         .name(format!("k92-{kind:?}"))
         .spawn(move || {
             let started = Instant::now();
+            // Long jobs must not be cut off by the PC going to sleep.
+            let _awake = matches!(kind, JobKind::Backup | JobKind::Restore | JobKind::Verify)
+                .then(k92_windows::KeepAwake::new);
             let _ = app.emit(JOB_EVENT, JobEvent::Started { kind });
             let last_emit = Mutex::new(Instant::now() - Duration::from_secs(1));
             let progress = |p: ProgressEvent| {

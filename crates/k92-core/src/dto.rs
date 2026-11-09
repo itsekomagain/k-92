@@ -61,6 +61,10 @@ pub struct ProgressEvent {
     pub files_total: Option<u64>,
     #[ts(type = "number")]
     pub bytes_done: u64,
+    /// Bytes this job expects to read (backup: new and changed files). `None` while unknown.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub bytes_total: Option<u64>,
     pub current_path: Option<String>,
 }
 

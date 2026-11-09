@@ -182,8 +182,9 @@ async function play(kind: JobKind, files: number, phase: "copying" | "restoring"
     const progress = {
       phase,
       filesDone: Math.round((files * i) / steps),
-      filesTotal: phase === "copying" ? null : files,
+      filesTotal: files,
       bytesDone: Math.round((i / steps) * 6.4 * MB),
+      bytesTotal: phase === "copying" ? Math.round(6.4 * MB) : null,
       currentPath: names[i % names.length] ?? null,
     };
     running = { ...running, progress };
