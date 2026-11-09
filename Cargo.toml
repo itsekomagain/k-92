@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/k92-core",
+  "crates/k92-repository",
+  "crates/k92-backup",
+  "crates/k92-restore",
+  "crates/k92-windows",
+  "crates/k92-cli",
+  "tests/integration",
+  "apps/desktop/src-tauri",
+]
+# The Tauri app is heavy to build; plain `cargo test` covers the engine crates.
+default-members = [
+  "crates/k92-core",
+  "crates/k92-repository",
+  "crates/k92-backup",
+  "crates/k92-restore",
+  "crates/k92-windows",
+  "crates/k92-cli",
+  "tests/integration",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

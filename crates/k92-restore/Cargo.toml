@@ -1,0 +1,23 @@
+[package]
+name = "k92-restore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+uuid = { version = "1.29.2", features = ["v4"] }
+blake3 = "1.8.7"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+k92-core = { version = "0.1.0", path = "../k92-core" }
+k92-repository = { version = "0.1.0", path = "../k92-repository" }
+tracing = "0.1.44"
+k92-windows = { version = "0.1.0", path = "../k92-windows" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+k92-backup = { path = "../k92-backup" }
+tempfile = "3.27.0"

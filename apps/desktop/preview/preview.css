@@ -1,0 +1,53 @@
+/* Preview-only chrome: a Windows 11 style window frame and narrow-screen fallbacks. */
+:root { --desk: #dfe5ee; --frame: #c9d0db; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --desk: #101114; --frame: #3a3d45; } }
+:root[data-theme="dark"] { --desk: #101114; --frame: #3a3d45; }
+
+html, body { height: 100%; }
+body { background: var(--desk); user-select: auto; }
+#root { height: 100%; }
+.preview-shell {
+  height: 100%; display: flex; flex-direction: column; gap: 12px;
+  padding-block: 16px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+.preview-note { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 14px; color: var(--text-2); font-size: 13px; }
+.preview-note strong { color: var(--text); font-size: 14px; }
+.preview-link { color: var(--accent); font-weight: 600; text-decoration: none; }
+.preview-link:hover { text-decoration: underline; }
+.win {
+  flex: 1; min-height: 520px; display: flex; flex-direction: column; overflow: hidden;
+  border: 1px solid var(--frame); border-radius: 8px; box-shadow: var(--shadow-lg); background: var(--bg);
+}
+.win-titlebar { height: 32px; display: flex; align-items: center; justify-content: space-between; background: var(--bg-sidebar); flex: none; font-size: 12px; }
+.win-app { display: flex; align-items: center; gap: 8px; padding-left: 12px; }
+.win-icon { width: 14px; height: 14px; border-radius: 4px; background: linear-gradient(135deg, #2b6cf6, #0b3fb8); }
+.win-controls { display: flex; height: 100%; }
+.win-controls svg { width: 46px; height: 100%; padding: 11px 18px; fill: none; stroke: var(--text); stroke-width: 1; }
+.win-body { flex: 1; min-height: 0; position: relative; }
+.win-body .app, .win-body .onboard { height: 100%; }
+.win-body .onboard { min-height: 0; overflow: auto; }
+.toast-wrap { right: max(32px, env(safe-area-inset-right, 0px)); bottom: 32px; }
+
+@media (max-width: 760px) {
+  .win { min-height: 640px; }
+  .app { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .sidebar { flex-direction: row; align-items: center; padding: 8px; gap: 8px; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--stroke); }
+  .brand { padding: 0 6px; } .brand-sub, .sidebar-foot { display: none; }
+  .nav { flex-direction: row; }
+  .nav-item { padding: 6px 10px; white-space: nowrap; }
+  .nav-item[aria-current="page"]::before { display: none; }
+  .page { padding: 16px; }
+  .page-head { flex-wrap: wrap; }
+  .grid-3, .grid-2 { grid-template-columns: minmax(0, 1fr); }
+  .hero { flex-wrap: wrap; padding: 18px; }
+  .tl { grid-template-columns: minmax(0, 1fr); grid-template-rows: 220px minmax(0, 1fr); }
+  .tl-rail { border-right: 0; border-bottom: 1px solid var(--stroke); }
+  .browser-bar, .action-bar { padding: 10px 12px; }
+  .browser-bar .input { width: 100% !important; }
+  .files { overflow-x: auto; }
+  .onboard { padding: 16px; }
+  .onboard-card { padding: 20px !important; }
+  .win-controls svg { width: 36px; padding: 11px 13px; }
+}

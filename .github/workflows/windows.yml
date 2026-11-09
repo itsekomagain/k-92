@@ -1,0 +1,56 @@
+# K-92 is a Windows application: this is the authoritative build and test pipeline.
+name: windows
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Engine tests (includes Windows-only tests, e.g. locked files)
+        run: cargo test --workspace --exclude k92-desktop
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: IPC bindings are up to date
+        run: |
+          cargo test -q -p k92-core
+          git diff --exit-code -- apps/desktop/src/ipc/bindings
+
+      - name: Frontend install and typecheck
+        working-directory: apps/desktop
+        run: |
+          npm ci
+          npm run typecheck
+
+      - name: Build installers (MSI + NSIS)
+        working-directory: apps/desktop
+        run: npx tauri build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: k92-windows-installers
+          path: |
+            target/release/bundle/msi/*.msi
+            target/release/bundle/nsis/*.exe

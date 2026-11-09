@@ -1,0 +1,21 @@
+[package]
+name = "k92-integration-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+k92-core = { path = "../../crates/k92-core" }
+k92-repository = { path = "../../crates/k92-repository" }
+k92-backup = { path = "../../crates/k92-backup" }
+k92-restore = { path = "../../crates/k92-restore" }
+tempfile = "3.27.0"
+blake3 = "1.8.7"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+
+[lints]
+workspace = true
