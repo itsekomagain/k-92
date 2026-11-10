@@ -197,7 +197,10 @@ mod tests {
     fn keep_awake_runs_caffeinate_and_stops_it() {
         let mut g = KeepAwake::new();
         let mut child = g.child.take().expect("caffeinate started");
-        assert!(child.try_wait().unwrap().is_none(), "caffeinate still running");
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "caffeinate still running"
+        );
         g.child = Some(child);
         let pid = g.child.as_ref().unwrap().id();
         drop(g);

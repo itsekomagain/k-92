@@ -22,7 +22,17 @@ jobs:
           cache-dependency-path: apps/desktop/package-lock.json
 
       - name: Engine tests
-        run: cargo test --workspace --exclude k92-desktop
+        run: |
+          set +e
+          cargo test --workspace --exclude k92-desktop 2>&1 | tee test.log
+          code=${PIPESTATUS[0]}
+          if [ "$code" -ne 0 ]; then
+            # Show failures as annotations so they are readable without opening the log.
+            grep -E "panicked|FAILED|failed|assert|error" test.log | head -40 | while IFS= read -r l; do
+              echo "::error title=test failure::$l"
+            done
+          fi
+          exit $code
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
